@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FinTrack — Link Account</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #f5f5f7;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 14px;
+      padding: 48px 56px;
+      box-shadow: 0 4px 32px rgba(0, 0, 0, .08);
+      text-align: center;
+      max-width: 440px;
+      width: 100%;
+    }
+
+    .logo {
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: -.3px;
+      color: #1d1d1f;
+      margin: 0 0 4px;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      margin: 0 0 10px;
+      color: #1d1d1f;
+    }
+
+    p {
+      color: #6e6e73;
+      margin: 0 0 36px;
+      line-height: 1.5;
+    }
+
+    button {
+      background: #0071e3;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 15px 36px;
+      font-size: 1rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.18s, opacity 0.18s;
+      width: 100%;
+    }
+
+    button:hover:not(:disabled) { background: #0077ed; }
+    button:disabled { opacity: 0.55; cursor: default; }
+
+    #status {
+      margin-top: 18px;
+      font-size: 0.88rem;
+      color: #6e6e73;
+      min-height: 20px;
+    }
+
+    #status.error { color: #d93025; }
+    #status.success { color: #1a8a1a; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <p class="logo">FinTrack</p>
+    <h1>Connect your bank</h1>
+    <p>
+      {% if reauth %}
+        Your connection needs to be refreshed. Click below to re-authenticate.
+      {% else %}
+        Link a bank account or brokerage to start tracking your spending.
+      {% endif %}
+    </p>
+
+    <button id="link-btn">
+      {% if reauth %}Re-authenticate{% else %}Connect Account{% endif %}
+    </button>
+    <div id="status"></div>
+  </div>
+
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <script>
+    const btn    = document.getElementById('link-btn');
+    const status = document.getElementById('status');
+
+    function setStatus(msg, type = '') {
+      status.textContent  = msg;
+      status.className    = type;
+    }
+
+    async function init() {
+      let res;
+      try {
+        res = await fetch('/api/link_token', { method: 'POST' });
+      } catch (e) {
+        setStatus('Could not reach server: ' + e.message, 'error');
+        return;
+      }
+
+      const data = await res.json();
+      if (data.error) { setStatus('Server error: ' + data.error, 'error'); return; }
+
+      const handler = Plaid.create({
+        token: data.link_token,
+
+        onSuccess: async (publicToken, metadata) => {
+          btn.disabled = true;
+          setStatus('Saving connection…');
+
+          let r;
+          try {
+            r = await fetch('/api/exchange', {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body:    JSON.stringify({ public_token: publicToken, metadata }),
+            });
+          } catch (e) {
+            btn.disabled = false;
+            setStatus('Network error: ' + e.message, 'error');
+            return;
+          }
+
+          const result = await r.json();
+          if (result.ok) {
+            btn.textContent = '✓ Connected';
+            setStatus(result.institution + ' linked — you can close this tab.', 'success');
+          } else {
+            btn.disabled = false;
+            setStatus('Error: ' + result.error, 'error');
+          }
+        },
+
+        onExit: (err) => {
+          if (err) setStatus(err.display_message || err.error_message || 'Exited.', 'error');
+        },
+      });
+
+      btn.onclick = () => handler.open();
+    }
+
+    init().catch(e => setStatus(e.message, 'error'));
+  </script>
+</body>
+</html>
