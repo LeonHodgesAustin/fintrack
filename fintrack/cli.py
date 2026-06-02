@@ -234,6 +234,173 @@ def report(
         conn.close()
 
 
+# -- budget --------------------------------------------------------------------
+
+@app.command()
+def budget(
+    months: int = typer.Option(3, "--months", "-m",
+                               help="Months of history to average (default 3)"),
+    what_if: Optional[str] = typer.Option(
+        None, "--what-if", "-w",
+        help="Scenario to model as 'Label:amount' — e.g. 'Child support increase:400'. "
+             "Repeat to stack multiple changes.",
+        show_default=False,
+    ),
+    what_if_extra: list[str] = typer.Option(
+        [], "--also", "-a",
+        help="Additional scenario changes (same format as --what-if).",
+    ),
+):
+    """
+    Monthly budget breakdown with optional what-if scenario modeling.
+
+    Shows averaged income, fixed loan payments, recurring charges, variable
+    spending, and transfers — then calculates your monthly surplus.
+
+    To model a change before committing to it:
+
+      fintrack budget --what-if "Child support increase:400"
+      fintrack budget --what-if "Child support increase:400" --also "Cut Dining:-150"
+    """
+    from .budget import build_budget, ScenarioChange
+
+    s = get_settings()
+    conn = _open_db()
+    try:
+        snap = build_budget(conn, months=months,
+                            transfer_categories=s.get_cashflow_transfer_categories(),
+                            savings_merchants=s.get_savings_transfer_merchants())
+
+        # ── Header ─────────────────────────────────────────────────────────
+        console.print(
+            f"\n[bold]Monthly Budget — {months}-month average "
+            f"({snap.period_label})[/]\n"
+        )
+
+        # ── Income ─────────────────────────────────────────────────────────
+        income_table = Table(title="Income", box=None, show_header=False, padding=(0, 2))
+        income_table.add_column(justify="left",  style="dim")
+        income_table.add_column(justify="right")
+        for src in snap.income_by_source:
+            income_table.add_row(src["category"], f"${src['avg_amount']:,.2f}/mo")
+        income_table.add_row("[bold]Total income[/]", f"[bold green]${snap.avg_income:,.2f}/mo[/]")
+        console.print(income_table)
+
+        # ── Fixed obligations ───────────────────────────────────────────────
+        if snap.loan_payments or snap.recurring:
+            console.print()
+            fixed_table = Table(title="Fixed Obligations", box=None, show_header=False, padding=(0, 2))
+            fixed_table.add_column(justify="left",  style="dim")
+            fixed_table.add_column(justify="right")
+            for l in snap.loan_payments:
+                fixed_table.add_row(
+                    f"{l['name']} ({l['type']}, {l['rate_pct']:.2f}%)",
+                    f"[red]-${l['monthly_payment']:,.2f}/mo[/]",
+                )
+            for r in snap.recurring:
+                src_tag = "" if r["source"] == "manual" else f" [dim][auto][/]"
+                fixed_table.add_row(
+                    f"{r['label']}{src_tag}",
+                    f"[red]-${r['monthly_amount']:,.2f}/mo[/]",
+                )
+            fixed_table.add_row(
+                "[bold]Total fixed[/]",
+                f"[bold red]-${snap.total_obligations:,.2f}/mo[/]",
+            )
+            console.print(fixed_table)
+
+        # ── Variable spending ───────────────────────────────────────────────
+        if snap.variable:
+            console.print()
+            var_table = Table(title="Variable Spending (avg)", box=None, show_header=False, padding=(0, 2))
+            var_table.add_column(justify="left",  style="dim")
+            var_table.add_column(justify="right")
+            for v in snap.variable:
+                var_table.add_row(v["category"], f"[yellow]-${v['avg_amount']:,.2f}/mo[/]")
+            var_table.add_row("[bold]Total variable[/]",
+                              f"[bold yellow]-${snap.total_variable:,.2f}/mo[/]")
+            console.print(var_table)
+
+        # ── Transfers out ───────────────────────────────────────────────────
+        if snap.transfer_detail:
+            console.print()
+            tr_table = Table(title="Transfers Out (avg)", box=None, show_header=False, padding=(0, 2))
+            tr_table.add_column(justify="left",  style="dim")
+            tr_table.add_column(justify="right")
+            for t in snap.transfer_detail:
+                tr_table.add_row(t["merchant"], f"[blue]-${t['avg_amount']:,.2f}/mo[/]")
+            tr_table.add_row("[bold]Total transfers[/]",
+                             f"[bold blue]-${snap.transfers_out:,.2f}/mo[/]")
+            console.print(tr_table)
+
+        if snap.savings_detail:
+            console.print()
+            sv_table = Table(
+                title="Savings Transfers (avg) [dim]-- still your money, not counted in deficit[/]",
+                box=None, show_header=False, padding=(0, 2),
+            )
+            sv_table.add_column(justify="left",  style="dim")
+            sv_table.add_column(justify="right")
+            for t in snap.savings_detail:
+                sv_table.add_row(t["merchant"], f"[cyan]${t['avg_amount']:,.2f}/mo[/]")
+            sv_table.add_row("[bold]Total savings[/]",
+                             f"[bold cyan]${snap.savings_out:,.2f}/mo[/]")
+            console.print(sv_table)
+
+        # ── Surplus ─────────────────────────────────────────────────────────
+        console.print()
+        surplus_color = "green" if snap.surplus >= 0 else "red"
+        console.print(
+            f"  [bold]Monthly surplus:  [{surplus_color}]${snap.surplus:,.2f}[/][/]"
+        )
+
+        # ── What-if scenario ────────────────────────────────────────────────
+        scenarios: list[ScenarioChange] = []
+        raw_scenarios = ([what_if] if what_if else []) + list(what_if_extra)
+
+        for raw in raw_scenarios:
+            try:
+                label, amt_str = raw.rsplit(":", 1)
+                scenarios.append(ScenarioChange(label.strip(), float(amt_str.strip())))
+            except ValueError:
+                console.print(f"[yellow]Could not parse scenario '{raw}' — use 'Label:amount'[/]")
+
+        if scenarios:
+            console.print()
+            console.rule("[bold]What-If Scenario[/]")
+            for sc in scenarios:
+                sign = "+" if sc.monthly_amount >= 0 else ""
+                color = "red" if sc.monthly_amount > 0 else "green"
+                console.print(
+                    f"  {sc.label}:  [{color}]{sign}${sc.monthly_amount:,.2f}/mo[/]"
+                )
+            new_surplus = snap.model_scenario(scenarios)
+            new_color = "green" if new_surplus >= 0 else "red"
+            delta = new_surplus - snap.surplus
+            delta_sign = "+" if delta >= 0 else ""
+            console.print()
+            console.print(
+                f"  Current surplus:   ${snap.surplus:,.2f}/mo\n"
+                f"  Scenario delta:    {delta_sign}${delta:,.2f}/mo\n"
+                f"  [bold]Adjusted surplus:  [{new_color}]${new_surplus:,.2f}/mo[/][/]"
+            )
+            if new_surplus >= 0:
+                console.print(
+                    f"\n  [green][OK] Affordable.[/] After this change you would still have "
+                    f"[bold]${new_surplus:,.2f}/mo[/] left over."
+                )
+            else:
+                shortfall = abs(new_surplus)
+                console.print(
+                    f"\n  [red][NO] Not affordable as-is.[/] This change creates a "
+                    f"[bold]${shortfall:,.2f}/mo shortfall[/]. "
+                    f"You would need to cut ${shortfall:,.2f}/mo from variable spending or transfers."
+                )
+
+    finally:
+        conn.close()
+
+
 # -- cashflow ------------------------------------------------------------------
 
 @app.command()

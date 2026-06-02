@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     # Cashflow: categories treated as internal transfers, excluded from income/expense
     cashflow_transfer_categories: str = "TRANSFER_IN,TRANSFER_OUT"
 
+    # Merchants whose TRANSFER_OUT transactions are internal savings moves —
+    # money still belongs to you, just in a different account.
+    # These are shown in the budget as "Savings" and excluded from the deficit.
+    # Example: Oportun pulls cash into goal-savings buckets; it's not an outflow.
+    savings_transfer_merchants: str = ""
+
+    def get_savings_transfer_merchants(self) -> set[str]:
+        return {m.strip().lower() for m in self.savings_transfer_merchants.split(",") if m.strip()}
+
     # Rentcast AVM API -- optional, used by `fintrack assets property refresh`
     # Free tier at rentcast.io (~50 requests/month). Leave blank to use manual values only.
     rentcast_api_key: str = ""
