@@ -17,6 +17,11 @@ class Settings(BaseSettings):
 
     db_path: str = "fintrack.db"
 
+    # Plaid products to request during Link. "transactions" covers all depository
+    # and credit accounts. Add "investments" only if you want to pull holdings/trades
+    # from a brokerage (requires implementing investment sync endpoints separately).
+    plaid_products: str = "transactions"
+
     # Comma-separated classifier names; resolved by classification.build_chain()
     classifier_chain: str = "rules,plaid"
 
@@ -66,6 +71,9 @@ class Settings(BaseSettings):
     llm_model: str = "claude-opus-4-8"
 
     # Helpers
+    def get_plaid_products(self) -> list[str]:
+        return [p.strip() for p in self.plaid_products.split(",") if p.strip()]
+
     def get_classifier_chain(self) -> list[str]:
         return [n.strip() for n in self.classifier_chain.split(",") if n.strip()]
 

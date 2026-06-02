@@ -82,6 +82,7 @@ def api_link_token():
                 client_user_id="fintrack-user",
                 client_name=_settings.plaid_client_name,
                 link_customization_name=_settings.link_customization_name,
+                products=_settings.get_plaid_products(),
             )
 
         return jsonify({"link_token": token})

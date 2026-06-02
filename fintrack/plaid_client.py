@@ -29,16 +29,19 @@ def create_link_token(
     client_user_id: str,
     client_name: str = "FinTrack",
     link_customization_name: str = "default",
+    products: list[str] | None = None,
 ) -> str:
     from plaid.model.country_code import CountryCode
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
     from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
     from plaid.model.products import Products
 
+    product_list = [Products(p) for p in (products or ["transactions"])]
+
     request = LinkTokenCreateRequest(
         user=LinkTokenCreateRequestUser(client_user_id=client_user_id),
         client_name=client_name,
-        products=[Products("transactions")],
+        products=product_list,
         country_codes=[CountryCode("US")],
         language="en",
         link_customization_name=link_customization_name,
