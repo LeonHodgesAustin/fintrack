@@ -105,6 +105,27 @@ def migrate(db_path: str) -> None:
                 sent_at     TEXT NOT NULL,
                 delivered   INTEGER NOT NULL DEFAULT 0
             );
+
+            -- Saved budget normalizations: annual-to-monthly conversions,
+            -- known one-time items, etc.  These auto-apply on every budget run
+            -- so you do not have to re-type --also flags each time.
+            CREATE TABLE IF NOT EXISTS budget_adjustments (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                label          TEXT NOT NULL,
+                monthly_amount REAL NOT NULL,
+                category       TEXT,
+                notes          TEXT,
+                active         INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT NOT NULL DEFAULT (date('now'))
+            );
+
+            -- Per-category spending targets shown alongside actuals.
+            CREATE TABLE IF NOT EXISTS budget_targets (
+                category      TEXT PRIMARY KEY,
+                target_amount REAL NOT NULL,
+                notes         TEXT,
+                updated_at    TEXT NOT NULL DEFAULT (date('now'))
+            );
         """)
         conn.commit()
 
@@ -328,3 +349,86 @@ def log_alert(conn, alert_type, message, delivered=False):
         "INSERT INTO alert_log (alert_type, message, sent_at, delivered) VALUES (?, ?, ?, ?)",
         (alert_type, message, datetime.now(timezone.utc).isoformat(), 1 if delivered else 0),
     )
+
+
+# -- Budget adjustment helpers ------------------------------------------------
+
+def add_budget_adjustment(
+    conn,
+    label: str,
+    monthly_amount: float,
+    category: str | None = None,
+    notes: str | None = None,
+) -> int:
+    """
+    Save a named normalization adjustment.
+    monthly_amount < 0 reduces the expense total (e.g. -1000 for "annual item ÷12").
+    Returns the new row id.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO budget_adjustments (label, monthly_amount, category, notes)
+        VALUES (?, ?, ?, ?)
+        """,
+        (label, monthly_amount, category, notes),
+    )
+    return cur.lastrowid
+
+
+def get_budget_adjustments(conn, active_only: bool = True) -> list[dict]:
+    where = "WHERE active = 1" if active_only else ""
+    rows = conn.execute(
+        f"SELECT * FROM budget_adjustments {where} ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_budget_adjustment(conn, adjustment_id: int) -> bool:
+    cur = conn.execute(
+        "DELETE FROM budget_adjustments WHERE id = ?", (adjustment_id,)
+    )
+    return cur.rowcount > 0
+
+
+def toggle_budget_adjustment(conn, adjustment_id: int, active: bool) -> bool:
+    cur = conn.execute(
+        "UPDATE budget_adjustments SET active = ? WHERE id = ?",
+        (1 if active else 0, adjustment_id),
+    )
+    return cur.rowcount > 0
+
+
+# -- Budget target helpers ----------------------------------------------------
+
+def set_budget_target(
+    conn,
+    category: str,
+    target_amount: float,
+    notes: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO budget_targets (category, target_amount, notes, updated_at)
+        VALUES (?, ?, ?, date('now'))
+        ON CONFLICT(category) DO UPDATE SET
+            target_amount = excluded.target_amount,
+            notes         = excluded.notes,
+            updated_at    = excluded.updated_at
+        """,
+        (category, target_amount, notes),
+    )
+
+
+def get_budget_targets(conn) -> dict[str, dict]:
+    """Return {category: {target_amount, notes, updated_at}} for all targets."""
+    rows = conn.execute(
+        "SELECT * FROM budget_targets ORDER BY category"
+    ).fetchall()
+    return {r["category"]: dict(r) for r in rows}
+
+
+def remove_budget_target(conn, category: str) -> bool:
+    cur = conn.execute(
+        "DELETE FROM budget_targets WHERE category = ?", (category,)
+    )
+    return cur.rowcount > 0

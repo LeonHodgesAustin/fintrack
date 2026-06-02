@@ -34,3 +34,4 @@ bofa_transactions_2_12_24_to_2_6_26.txt
 alerts.log
 pytest-cache-files-z2jb18t5/v/cache/lastfailed
 pytest-cache-files-z2jb18t5/v/cache/nodeids
+fintrack.db-wal

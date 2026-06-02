@@ -50,6 +50,15 @@ class BudgetSnapshot:
     savings_out: float = 0.0
     savings_detail: list[dict] = field(default_factory=list)
 
+    # Saved normalizations from the budget_adjustments table.
+    # Negative amounts reduce the expense total (e.g. -1000 strips an annual
+    # item that inflated one month's average).
+    saved_adjustments: list[dict] = field(default_factory=list)
+
+    # Per-category spending targets from the budget_targets table.
+    # {category: {target_amount, notes, ...}}
+    targets: dict = field(default_factory=dict)
+
     @property
     def total_loans(self) -> float:
         return round(sum(l["monthly_payment"] for l in self.loan_payments), 2)
@@ -67,10 +76,15 @@ class BudgetSnapshot:
         return round(self.total_loans + self.total_recurring, 2)
 
     @property
-    def surplus(self) -> float:
+    def total_saved_adjustments(self) -> float:
+        """Net monthly delta from all active saved adjustments."""
+        return round(sum(a["monthly_amount"] for a in self.saved_adjustments), 2)
+
+    @property
+    def raw_surplus(self) -> float:
         """
-        Spendable surplus after all real obligations, spending, and true outflows.
-        Savings transfers are excluded — that money is still yours.
+        Surplus straight from transaction history — before any saved
+        normalization adjustments are applied.  Shows the unedited picture.
         """
         return round(
             self.avg_income
@@ -81,8 +95,17 @@ class BudgetSnapshot:
             2,
         )
 
+    @property
+    def surplus(self) -> float:
+        """
+        Surplus after applying all active saved normalizations.
+        This is the number used for what-if scenario modeling.
+        Savings transfers are excluded — that money is still yours.
+        """
+        return round(self.raw_surplus - self.total_saved_adjustments, 2)
+
     def model_scenario(self, changes: list[ScenarioChange]) -> float:
-        """Return adjusted surplus after applying a list of monthly changes."""
+        """Return adjusted surplus after applying additional one-off changes."""
         delta = sum(c.monthly_amount for c in changes)
         return round(self.surplus - delta, 2)
 
@@ -212,9 +235,34 @@ def build_budget(
             if len(word) > 3
         }
 
+        # ALSO pull merchant names from actual LOAN_PAYMENTS transactions.
+        # This catches cases where the servicer name (e.g. "Aqua Finance")
+        # differs from the loan's label in the assets DB (e.g. "Roof Loan").
+        # Any merchant that has ever appeared in a LOAN_PAYMENTS transaction
+        # is a loan servicer and should not also appear in recurring.
+        _loan_servicer_names: set[str] = {
+            row[0].strip().lower()
+            for row in conn.execute(
+                "SELECT COALESCE(merchant_name, raw_name, '') "
+                "FROM transactions "
+                "WHERE category_primary = 'LOAN_PAYMENTS' AND amount > 0 "
+                "GROUP BY COALESCE(merchant_name, raw_name)"
+            ).fetchall()
+            if row[0].strip()
+        }
+
         def _is_loan_duplicate(merchant: str) -> bool:
             ml = merchant.lower()
-            return any(frag in ml for frag in loan_name_fragments)
+            # Match against word fragments from the loan name in the assets DB
+            if any(frag in ml for frag in loan_name_fragments):
+                return True
+            # Match against known LOAN_PAYMENTS merchants from transaction history
+            # (len > 4 guard prevents short tokens like "co." producing false hits)
+            return any(
+                (lm in ml or ml in lm)
+                for lm in _loan_servicer_names
+                if len(lm) > 4
+            )
 
         snap.recurring = [
             {"label": c.merchant, "monthly_amount": c.expected_amount,
@@ -228,10 +276,48 @@ def build_budget(
         pass
 
     # ── Variable spending ─────────────────────────────────────────────────────
-    # Exclude transfers (tracked separately), income, and loan payments
-    # (loan payments are already in fixed obligations from the loans table).
+    # Exclude transfers, income, loan payments, AND merchants already captured
+    # in recurring fixed obligations (e.g. streaming subscriptions that Plaid
+    # categorizes as ENTERTAINMENT while also appearing in the recurring list).
+    #
+    # Matching strategy — two passes to handle billing-entity mismatches:
+    #   1. Whole label:  "YouTube Premium" → NOT LIKE '%youtube premium%'
+    #   2. First token:  "YouTube" (from "YouTube Premium") → NOT LIKE '%youtube%'
+    # This catches cases where Plaid enriches the merchant_name differently
+    # from the subscription service name (e.g. YouTube billed as "Google").
+    recurring_merchants_lower = [r["label"].lower() for r in snap.recurring]
+
+    # Build de-duplicated list of patterns: full label + first significant token.
+    # The first-token fallback handles billing-entity mismatches: "YouTube Premium"
+    # (recurring label) may be charged as "Google" in Plaid, so we also try
+    # NOT LIKE '%youtube%'.  We only use the FIRST token to avoid over-matching —
+    # adding '%premium%' would incorrectly exclude unrelated "Premium" merchants.
+    _seen_patterns: set[str] = set()
+    _exclusion_patterns: list[str] = []
+    for label in recurring_merchants_lower:
+        for candidate in [label]:
+            pat = f"%{candidate}%"
+            if pat not in _seen_patterns:
+                _seen_patterns.add(pat)
+                _exclusion_patterns.append(pat)
+        # First significant word as fallback (len > 4 skips short filler words)
+        first_word = next((tok for tok in label.split() if len(tok) > 4), None)
+        if first_word and first_word != label:
+            pat = f"%{first_word}%"
+            if pat not in _seen_patterns:
+                _seen_patterns.add(pat)
+                _exclusion_patterns.append(pat)
+
+    merchant_exclusion_clauses = " AND ".join(
+        "LOWER(COALESCE(merchant_name, raw_name, '')) NOT LIKE ?"
+        for _ in _exclusion_patterns
+    )
+    merchant_params = _exclusion_patterns
+
+    where_extra = f"AND {merchant_exclusion_clauses}" if merchant_exclusion_clauses else ""
+
     variable_rows = conn.execute(
-        """
+        f"""
         SELECT
             COALESCE(category_primary, 'UNCATEGORIZED') AS category,
             SUM(amount) / ? AS avg_amount,
@@ -244,10 +330,11 @@ def build_budget(
               'TRANSFER_IN', 'TRANSFER_OUT',
               'LOAN_PAYMENTS', 'INCOME'
           )
+          {where_extra}
         GROUP BY category_primary
         ORDER BY avg_amount DESC
         """,
-        (months, start_date, end_date),
+        [months, start_date, end_date] + merchant_params,
     ).fetchall()
 
     snap.variable = [dict(r) for r in variable_rows]
@@ -296,5 +383,19 @@ def build_budget(
 
     snap.transfers_out = round(sum(r["avg_amount"] for r in snap.transfer_detail), 2)
     snap.savings_out   = round(sum(r["avg_amount"] for r in snap.savings_detail), 2)
+
+    # ── Saved adjustments ─────────────────────────────────────────────────────
+    try:
+        from .db import get_budget_adjustments
+        snap.saved_adjustments = get_budget_adjustments(conn, active_only=True)
+    except Exception:
+        pass
+
+    # ── Category targets ──────────────────────────────────────────────────────
+    try:
+        from .db import get_budget_targets
+        snap.targets = get_budget_targets(conn)
+    except Exception:
+        pass
 
     return snap

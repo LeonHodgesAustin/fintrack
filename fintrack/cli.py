@@ -55,6 +55,12 @@ assets_app.add_typer(property_app, name="property")
 assets_app.add_typer(equity_app,   name="equity")
 assets_app.add_typer(account_app,  name="account")
 
+adjust_app = typer.Typer(help="Saved budget normalizations (annual→monthly, one-time items, etc.)")
+app.add_typer(adjust_app, name="adjust")
+
+target_app = typer.Typer(help="Per-category monthly spending targets.")
+app.add_typer(target_app, name="target")
+
 console = Console()
 
 PLAID_CATEGORIES = [
@@ -240,6 +246,12 @@ def report(
 def budget(
     months: int = typer.Option(3, "--months", "-m",
                                help="Months of history to average (default 3)"),
+    set_income: Optional[float] = typer.Option(
+        None, "--income", "-i",
+        help="Override detected income with a known monthly take-home (e.g. 6500). "
+             "Use this to model against payroll only, ignoring investment returns "
+             "and other non-reliable credits.",
+    ),
     what_if: Optional[str] = typer.Option(
         None, "--what-if", "-w",
         help="Scenario to model as 'Label:amount' — e.g. 'Child support increase:400'. "
@@ -271,6 +283,9 @@ def budget(
                             transfer_categories=s.get_cashflow_transfer_categories(),
                             savings_merchants=s.get_savings_transfer_merchants())
 
+        if set_income is not None:
+            snap.avg_income = set_income
+
         # ── Header ─────────────────────────────────────────────────────────
         console.print(
             f"\n[bold]Monthly Budget — {months}-month average "
@@ -281,8 +296,13 @@ def budget(
         income_table = Table(title="Income", box=None, show_header=False, padding=(0, 2))
         income_table.add_column(justify="left",  style="dim")
         income_table.add_column(justify="right")
-        for src in snap.income_by_source:
-            income_table.add_row(src["category"], f"${src['avg_amount']:,.2f}/mo")
+        if set_income is not None:
+            income_table.add_row("[dim]Transaction-detected (not used)[/]",
+                                 f"[dim]${sum(r['avg_amount'] for r in snap.income_by_source):,.2f}/mo[/]")
+            income_table.add_row("Payroll (manual override)", f"${set_income:,.2f}/mo")
+        else:
+            for src in snap.income_by_source:
+                income_table.add_row(src["category"], f"${src['avg_amount']:,.2f}/mo")
         income_table.add_row("[bold]Total income[/]", f"[bold green]${snap.avg_income:,.2f}/mo[/]")
         console.print(income_table)
 
@@ -312,13 +332,35 @@ def budget(
         # ── Variable spending ───────────────────────────────────────────────
         if snap.variable:
             console.print()
-            var_table = Table(title="Variable Spending (avg)", box=None, show_header=False, padding=(0, 2))
+            has_targets = bool(snap.targets)
+            var_table = Table(title="Variable Spending (avg)", box=None,
+                              show_header=False, padding=(0, 2))
             var_table.add_column(justify="left",  style="dim")
             var_table.add_column(justify="right")
+            if has_targets:
+                var_table.add_column(justify="left", style="dim")  # target column
             for v in snap.variable:
-                var_table.add_row(v["category"], f"[yellow]-${v['avg_amount']:,.2f}/mo[/]")
-            var_table.add_row("[bold]Total variable[/]",
-                              f"[bold yellow]-${snap.total_variable:,.2f}/mo[/]")
+                cat = v["category"]
+                amt_str = f"[yellow]-${v['avg_amount']:,.2f}/mo[/]"
+                if has_targets:
+                    if cat in snap.targets:
+                        tgt = snap.targets[cat]["target_amount"]
+                        over = v["avg_amount"] - tgt
+                        if over > 0:
+                            tgt_str = f"[red]target ${tgt:,.0f}  OVER ${over:,.0f}[/]"
+                        else:
+                            tgt_str = f"[green]target ${tgt:,.0f}  under ${abs(over):,.0f}[/]"
+                    else:
+                        tgt_str = ""
+                    var_table.add_row(cat, amt_str, tgt_str)
+                else:
+                    var_table.add_row(cat, amt_str)
+            if has_targets:
+                var_table.add_row("[bold]Total variable[/]",
+                                  f"[bold yellow]-${snap.total_variable:,.2f}/mo[/]", "")
+            else:
+                var_table.add_row("[bold]Total variable[/]",
+                                  f"[bold yellow]-${snap.total_variable:,.2f}/mo[/]")
             console.print(var_table)
 
         # ── Transfers out ───────────────────────────────────────────────────
@@ -349,9 +391,47 @@ def budget(
 
         # ── Surplus ─────────────────────────────────────────────────────────
         console.print()
+        if snap.saved_adjustments:
+            # Show raw → adjustments → adjusted breakdown
+            raw_color = "green" if snap.raw_surplus >= 0 else "red"
+            console.print(
+                f"  Monthly surplus (raw):        [{raw_color}]${snap.raw_surplus:,.2f}/mo[/]"
+            )
+            console.print()
+
+            adj_table = Table(
+                title=f"Saved Normalizations ({len(snap.saved_adjustments)} active)",
+                box=None, show_header=False, padding=(0, 2),
+            )
+            adj_table.add_column("id",    justify="right", style="dim")
+            adj_table.add_column("label", justify="left",  style="dim")
+            adj_table.add_column("amt",   justify="right")
+            adj_table.add_column("cat",   justify="left",  style="dim")
+            for a in snap.saved_adjustments:
+                amt = a["monthly_amount"]
+                color = "green" if amt < 0 else "red"
+                sign  = "+" if amt > 0 else ""
+                cat_tag = f"({a['category']})" if a.get("category") else ""
+                adj_table.add_row(
+                    f"[{a['id']}]",
+                    a["label"],
+                    f"[{color}]{sign}${amt:,.2f}/mo[/]",
+                    cat_tag,
+                )
+            net = snap.total_saved_adjustments
+            net_sign  = "+" if net > 0 else ""
+            net_color = "green" if net < 0 else "red"
+            adj_table.add_row(
+                "", "[bold]Net adjustments[/]",
+                f"[bold {net_color}]{net_sign}${net:,.2f}/mo[/]", "",
+            )
+            console.print(adj_table)
+            console.print()
+
         surplus_color = "green" if snap.surplus >= 0 else "red"
+        surplus_label = "Monthly surplus (adjusted):" if snap.saved_adjustments else "Monthly surplus:          "
         console.print(
-            f"  [bold]Monthly surplus:  [{surplus_color}]${snap.surplus:,.2f}[/][/]"
+            f"  [bold]{surplus_label}  [{surplus_color}]${snap.surplus:,.2f}/mo[/][/]"
         )
 
         # ── What-if scenario ────────────────────────────────────────────────
@@ -397,6 +477,86 @@ def budget(
                     f"You would need to cut ${shortfall:,.2f}/mo from variable spending or transfers."
                 )
 
+    finally:
+        conn.close()
+
+
+# -- drill ---------------------------------------------------------------------
+
+@app.command()
+def drill(
+    category: str = typer.Argument(..., help="Category to inspect (e.g. CHILDCARE, FOOD_AND_DRINK)"),
+    months:   int = typer.Option(3,    "--months", "-m", help="Months to look back"),
+    limit:    int = typer.Option(50,   "--limit",  "-n", help="Max transactions to show"),
+):
+    """
+    Show every transaction behind a budget category so you can see what's
+    actually driving the number.
+
+      fintrack drill CHILDCARE
+      fintrack drill FOOD_AND_DRINK --months 1
+    """
+    from datetime import date as _date
+
+    today = _date.today()
+    m = today.month - months
+    y = today.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    start = _date(y, m, 1).isoformat()
+    end   = _date(today.year, today.month, 1).isoformat()
+
+    conn = _open_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                t.date,
+                COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant,
+                t.amount,
+                t.category_detailed,
+                t.category_source,
+                i.institution_name,
+                a.name AS account_name
+            FROM transactions t
+            JOIN accounts a ON a.account_id = t.account_id
+            JOIN items    i ON i.item_id    = a.item_id
+            WHERE t.category_primary = ?
+              AND t.date >= ? AND t.date < ?
+              AND t.amount > 0
+              AND t.pending = 0
+            ORDER BY t.amount DESC
+            LIMIT ?
+            """,
+            (category.upper(), start, end, limit),
+        ).fetchall()
+
+        if not rows:
+            console.print(f"[yellow]No transactions found in {category} for the last {months} month(s).[/]")
+            return
+
+        total = sum(r["amount"] for r in rows)
+        monthly_avg = total / months
+
+        t = Table(title=f"{category} — last {months} month(s)  |  total ${total:,.2f}  |  avg ${monthly_avg:,.2f}/mo")
+        t.add_column("Date")
+        t.add_column("Merchant")
+        t.add_column("Amount", justify="right")
+        t.add_column("Subcategory", style="dim")
+        t.add_column("Account", style="dim")
+
+        for r in rows:
+            t.add_row(
+                r["date"],
+                (r["merchant"] or "")[:40],
+                f"${r['amount']:,.2f}",
+                (r["category_detailed"] or "").replace(f"{category}_", "").replace("_", " ").lower(),
+                f"{r['institution_name'][:12]} / {r['account_name'][:12]}",
+            )
+        console.print(t)
+        console.print(f"\n  [dim]Showing top {min(limit, len(rows))} of {len(rows)} transactions. "
+                      f"Use --months or --limit to adjust.[/]")
     finally:
         conn.close()
 
@@ -1704,5 +1864,246 @@ def account_remove(
         delete_manual_account(conn, account_id)
         conn.commit()
         console.print(f"[green]Account #{account_id} removed.[/]")
+    finally:
+        conn.close()
+
+
+# ── fintrack adjust ──────────────────────────────────────────────────────────
+# Saved budget normalizations: annual→monthly conversions, known one-time items,
+# etc.  These auto-apply on every `fintrack budget` run.
+#
+# Examples:
+#   fintrack adjust add "Summer camp annual /12" -1000 --category FOOD_AND_DRINK
+#   fintrack adjust add "Motorsport Reg annual"   -460 --category ENTERTAINMENT
+#   fintrack adjust list
+#   fintrack adjust rm 3
+#   fintrack adjust off 2   (keep the entry but disable it temporarily)
+#   fintrack adjust on  2
+
+@adjust_app.command("add")
+def adjust_add(
+    label:   str   = typer.Argument(..., help="Description of the adjustment"),
+    amount:  float = typer.Option(..., "--amount", "-a",
+                        help="Monthly delta (negative = reduces expense). "
+                             "Always use --amount / -a so negative values are "
+                             "not mistaken for option flags."),
+    category: Optional[str] = typer.Option(
+        None, "--category", "-c",
+        help="Variable spending category this offsets (e.g. FOOD_AND_DRINK). "
+             "Display-only; does not affect the math.",
+    ),
+    notes: Optional[str] = typer.Option(
+        None, "--notes", "-n", help="Free-text explanation (optional).",
+    ),
+):
+    """
+    Save a named normalization so it auto-applies on every budget run.
+
+    Use negative amounts to remove inflated spending (annual items, one-time
+    purchases that distort a 3-month average).  Always pass the amount via
+    --amount / -a so the leading minus sign is not parsed as an option flag:
+
+      fintrack adjust add "Echo Hill summer camp /12" -a -1000 -c CHILDCARE
+      fintrack adjust add "Motorsport Reg annual"     -a  -460 -c ENTERTAINMENT
+      fintrack adjust add "Amazon Prime annual /12"   -a  -138
+    """
+    from .db import add_budget_adjustment
+    conn = _open_db()
+    try:
+        adj_id = add_budget_adjustment(conn, label, amount, category, notes)
+        conn.commit()
+        sign  = "+" if amount > 0 else ""
+        color = "red" if amount > 0 else "green"
+        console.print(
+            f"[green]Saved[/] adjustment [dim][{adj_id}][/] "
+            f"[bold]{label}[/]: [{color}]{sign}${amount:,.2f}/mo[/]"
+        )
+    finally:
+        conn.close()
+
+
+@adjust_app.command("list")
+def adjust_list(
+    all_items: bool = typer.Option(False, "--all", "-a",
+                                   help="Show disabled items too"),
+):
+    """List all saved budget normalizations."""
+    from .db import get_budget_adjustments
+    conn = _open_db()
+    try:
+        rows = get_budget_adjustments(conn, active_only=not all_items)
+        if not rows:
+            console.print("[dim]No saved adjustments yet.  Use [bold]fintrack adjust add[/] to create one.[/]")
+            return
+        table = Table(title="Saved Budget Adjustments", box=None, show_header=True)
+        table.add_column("ID",       justify="right", style="dim")
+        table.add_column("Label",    justify="left")
+        table.add_column("Monthly",  justify="right")
+        table.add_column("Category", justify="left", style="dim")
+        table.add_column("Notes",    justify="left", style="dim")
+        table.add_column("Active",   justify="center")
+        net = 0.0
+        for r in rows:
+            amt   = r["monthly_amount"]
+            sign  = "+" if amt > 0 else ""
+            color = "red" if amt > 0 else "green"
+            net  += amt
+            active_str = "[green]yes[/]" if r["active"] else "[dim]no[/]"
+            table.add_row(
+                str(r["id"]),
+                r["label"],
+                f"[{color}]{sign}${amt:,.2f}/mo[/]",
+                r["category"] or "",
+                r["notes"] or "",
+                active_str,
+            )
+        net_sign  = "+" if net > 0 else ""
+        net_color = "red" if net > 0 else "green"
+        table.add_row(
+            "", "[bold]Net[/]",
+            f"[bold {net_color}]{net_sign}${net:,.2f}/mo[/]",
+            "", "", "",
+        )
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@adjust_app.command("rm")
+def adjust_rm(
+    adjustment_id: int = typer.Argument(..., help="ID from 'fintrack adjust list'"),
+):
+    """Permanently delete a saved adjustment."""
+    from .db import remove_budget_adjustment
+    conn = _open_db()
+    try:
+        ok = remove_budget_adjustment(conn, adjustment_id)
+        conn.commit()
+        if ok:
+            console.print(f"[green]Removed adjustment #{adjustment_id}.[/]")
+        else:
+            console.print(f"[yellow]No adjustment with ID {adjustment_id}.[/]")
+    finally:
+        conn.close()
+
+
+@adjust_app.command("off")
+def adjust_off(
+    adjustment_id: int = typer.Argument(..., help="ID from 'fintrack adjust list'"),
+):
+    """Disable a saved adjustment without deleting it (useful for seasonal items)."""
+    from .db import toggle_budget_adjustment
+    conn = _open_db()
+    try:
+        ok = toggle_budget_adjustment(conn, adjustment_id, active=False)
+        conn.commit()
+        if ok:
+            console.print(f"[dim]Adjustment #{adjustment_id} disabled. Re-enable with [bold]fintrack adjust on {adjustment_id}[/].[/]")
+        else:
+            console.print(f"[yellow]No adjustment with ID {adjustment_id}.[/]")
+    finally:
+        conn.close()
+
+
+@adjust_app.command("on")
+def adjust_on(
+    adjustment_id: int = typer.Argument(..., help="ID from 'fintrack adjust list'"),
+):
+    """Re-enable a previously disabled adjustment."""
+    from .db import toggle_budget_adjustment
+    conn = _open_db()
+    try:
+        ok = toggle_budget_adjustment(conn, adjustment_id, active=True)
+        conn.commit()
+        if ok:
+            console.print(f"[green]Adjustment #{adjustment_id} enabled.[/]")
+        else:
+            console.print(f"[yellow]No adjustment with ID {adjustment_id}.[/]")
+    finally:
+        conn.close()
+
+
+# ── fintrack target ──────────────────────────────────────────────────────────
+# Per-category monthly spending targets shown alongside actuals in the budget.
+#
+# Examples:
+#   fintrack target set FOOD_AND_DRINK 800
+#   fintrack target set ENTERTAINMENT  200  --notes "racing only a few times/year"
+#   fintrack target list
+#   fintrack target rm FOOD_AND_DRINK
+
+@target_app.command("set")
+def target_set(
+    category:      str   = typer.Argument(..., help="Category primary name (e.g. FOOD_AND_DRINK)"),
+    target_amount: float = typer.Argument(..., help="Monthly spending target ($)"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Optional reminder note"),
+):
+    """
+    Set a monthly spending target for a category.
+
+    The target appears in the Variable Spending section of 'fintrack budget',
+    showing whether you are over or under each month.
+
+      fintrack target set FOOD_AND_DRINK 800
+      fintrack target set ENTERTAINMENT  200
+      fintrack target set GENERAL_MERCHANDISE 300
+
+    Run 'fintrack drill CATEGORY' to see a breakdown before deciding on a target.
+    """
+    from .db import set_budget_target
+    conn = _open_db()
+    try:
+        set_budget_target(conn, category.upper(), target_amount, notes)
+        conn.commit()
+        console.print(
+            f"[green]Target set:[/] [bold]{category.upper()}[/] → "
+            f"[bold]${target_amount:,.2f}/mo[/]"
+            + (f"  [dim]({notes})[/]" if notes else "")
+        )
+    finally:
+        conn.close()
+
+
+@target_app.command("list")
+def target_list():
+    """Show all category spending targets."""
+    from .db import get_budget_targets
+    conn = _open_db()
+    try:
+        targets = get_budget_targets(conn)
+        if not targets:
+            console.print("[dim]No targets set yet.  Use [bold]fintrack target set CATEGORY AMOUNT[/].[/]")
+            return
+        table = Table(title="Spending Targets", box=None)
+        table.add_column("Category",  justify="left")
+        table.add_column("Target",    justify="right")
+        table.add_column("Notes",     justify="left", style="dim")
+        table.add_column("Updated",   justify="left", style="dim")
+        for cat, t in targets.items():
+            table.add_row(
+                cat,
+                f"${t['target_amount']:,.2f}/mo",
+                t["notes"] or "",
+                t["updated_at"],
+            )
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@target_app.command("rm")
+def target_rm(
+    category: str = typer.Argument(..., help="Category to remove the target for"),
+):
+    """Remove a category spending target."""
+    from .db import remove_budget_target
+    conn = _open_db()
+    try:
+        ok = remove_budget_target(conn, category.upper())
+        conn.commit()
+        if ok:
+            console.print(f"[green]Target for {category.upper()} removed.[/]")
+        else:
+            console.print(f"[yellow]No target found for {category.upper()}.[/]")
     finally:
         conn.close()
