@@ -28,6 +28,7 @@ def create_link_token(
     client: plaid_api.PlaidApi,
     client_user_id: str,
     client_name: str = "FinTrack",
+    link_customization_name: str = "default",
 ) -> str:
     from plaid.model.country_code import CountryCode
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
@@ -40,6 +41,7 @@ def create_link_token(
         products=[Products("transactions")],
         country_codes=[CountryCode("US")],
         language="en",
+        link_customization_name=link_customization_name,
     )
     response = client.link_token_create(request)
     return response.link_token
@@ -50,6 +52,7 @@ def create_update_link_token(
     access_token: str,
     client_user_id: str,
     client_name: str = "FinTrack",
+    link_customization_name: str = "default",
 ) -> str:
     """Create a link token for the update/reauth flow."""
     from plaid.model.country_code import CountryCode
@@ -62,6 +65,7 @@ def create_update_link_token(
         country_codes=[CountryCode("US")],
         language="en",
         access_token=access_token,
+        link_customization_name=link_customization_name,
     )
     response = client.link_token_create(request)
     return response.link_token

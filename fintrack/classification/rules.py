@@ -46,8 +46,9 @@ _RULES: list[_Rule] = [
     _r(r"at&t|verizon|t-mobile|xfinity|spectrum|comcast|cox comm|con ed|pg&e|utility|electric|national grid", "UTILITIES", "UTILITIES_PHONE_AND_INTERNET", 0.85),
     # Insurance
     _r(r"geico|state farm|allstate|progressive|liberty mutual|nationwide|aaa insurance", "GENERAL_SERVICES", "INSURANCE", 0.88),
-    # Investment / brokerage (Stash-specific keyword too)
-    _r(r"stash\b|robinhood|fidelity|schwab|vanguard|e\*trade|td ameritrade|webull", "INCOME", "INVESTMENT", 0.88),
+    # Investment / brokerage transfers — these are money moving OUT to an investment account,
+    # not income. Stash, Robinhood et al. appear in bank feeds as ACH debits, not credits.
+    _r(r"stash\b|robinhood|fidelity|schwab|vanguard|e\*trade|td ameritrade|webull", "TRANSFER_OUT", "TRANSFER_OUT_INVESTMENT_AND_RETIREMENT_FUNDS", 0.85),
     # ATM / cash
     _r(r"\batm\b|cash withdrawal|zelle|venmo|cashapp|paypal", "TRANSFER_IN", "CASH_ADVANCE_AND_TRANSFER", 0.80),
 ]

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fintrack"
-version = "0.1.0"
-description = "Personal financial management — Plaid transactions + spending characterization"
+version = "0.2.0"
+description = "Personal financial management -- Plaid transactions + spending characterization"
 requires-python = ">=3.11"
 dependencies = [
     "plaid-python>=20.1.0",
@@ -13,12 +13,19 @@ dependencies = [
     "flask>=3.0.0",
     "pydantic-settings>=2.3.0",
     "rich>=13.7.0",
+    "cryptography>=42.0.0",
+    "gspread>=6.0.0",
+    "google-auth>=2.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
     "pytest-cov>=5.0.0",
+]
+forecast = [
+    "prophet>=1.1.0",
+    "pandas>=2.0.0",
 ]
 
 [project.scripts]
@@ -29,3 +36,6 @@ packages = ["fintrack"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "sandbox: requires real Plaid sandbox credentials -- run with: pytest -m sandbox",
+]

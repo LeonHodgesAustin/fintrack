@@ -14,7 +14,9 @@ The server exposes:
 """
 
 import os
+import signal
 import sys
+import threading
 
 # Allow running as __main__ from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, jsonify, render_template, request
 
 from fintrack.config import get_settings
-from fintrack.db import get_connection, insert_item, migrate
+from fintrack.db import configure_encryption, get_connection, insert_item, migrate
 from fintrack.plaid_client import (
     create_client,
     create_link_token,
@@ -35,6 +37,7 @@ app = Flask(__name__)
 
 _settings = get_settings()
 app.secret_key = _settings.flask_secret_key
+configure_encryption(_settings.fernet_key)
 
 _plaid_client = create_client(
     _settings.plaid_client_id,
@@ -70,9 +73,16 @@ def api_link_token():
                 _plaid_client,
                 access_token=row["access_token"],
                 client_user_id="fintrack-user",
+                client_name=_settings.plaid_client_name,
+                link_customization_name=_settings.link_customization_name,
             )
         else:
-            token = create_link_token(_plaid_client, client_user_id="fintrack-user")
+            token = create_link_token(
+                _plaid_client,
+                client_user_id="fintrack-user",
+                client_name=_settings.plaid_client_name,
+                link_customization_name=_settings.link_customization_name,
+            )
 
         return jsonify({"link_token": token})
     except Exception as exc:
@@ -99,6 +109,9 @@ def api_exchange():
         finally:
             conn.close()
 
+        # Shut down the server half a second after responding so the browser
+        # receives the success response before the process exits.
+        threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         return jsonify({"ok": True, "institution": institution_name, "item_id": item_id})
 
     except Exception as exc:

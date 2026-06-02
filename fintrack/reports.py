@@ -6,7 +6,7 @@ negative = income/credit. Reports treat positive amounts as expenses.
 
 import sqlite3
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 
 
 def _month_bounds(year: int, month: int) -> tuple[str, str]:
@@ -116,6 +116,47 @@ def mom_trends(
     ).fetchall()
 
     return list(reversed([dict(r) for r in rows]))
+
+
+def recent_transactions(
+    conn: sqlite3.Connection,
+    days: int = 90,
+    exclude_pending: bool = False,
+) -> list[dict]:
+    """
+    Transactions from the last N days, joined with account and institution info.
+    Returns rows sorted by date descending, then amount descending.
+
+    Each dict includes: date, institution_name, account_name, merchant_name,
+    raw_name, category_primary, category_detailed, category_source, amount, pending.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    pending_filter = "AND t.pending = 0" if exclude_pending else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            t.transaction_id,
+            t.date,
+            i.institution_name,
+            a.name              AS account_name,
+            t.merchant_name,
+            t.raw_name,
+            t.category_primary,
+            t.category_detailed,
+            t.category_source,
+            t.amount,
+            t.pending
+        FROM transactions t
+        JOIN accounts a ON a.account_id = t.account_id
+        JOIN items    i ON i.item_id    = a.item_id
+        WHERE t.date >= ? {pending_filter}
+        ORDER BY t.date DESC, t.amount DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    return [dict(r) for r in rows]
 
 
 def category_trends(
