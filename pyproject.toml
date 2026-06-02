@@ -27,6 +27,9 @@ forecast = [
     "prophet>=1.1.0",
     "pandas>=2.0.0",
 ]
+assets = [
+    "yfinance>=0.2.40",
+]
 
 [project.scripts]
 fintrack = "fintrack.cli:app"

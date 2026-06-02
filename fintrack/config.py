@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # Cashflow: categories treated as internal transfers, excluded from income/expense
     cashflow_transfer_categories: str = "TRANSFER_IN,TRANSFER_OUT"
 
+    # Rentcast AVM API -- optional, used by `fintrack assets property refresh`
+    # Free tier at rentcast.io (~50 requests/month). Leave blank to use manual values only.
+    rentcast_api_key: str = ""
+
     # Optional -- only needed when classification/llm.py is added
     anthropic_api_key: str = ""
     llm_model: str = "claude-opus-4-8"
