@@ -16,6 +16,7 @@ Design notes:
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import plaid
@@ -27,6 +28,7 @@ from .db import (
     clear_item_error,
     delete_transaction,
     get_all_overrides,
+    insert_balance_snapshot,
     set_item_error,
     update_item_cursor,
     upsert_account,
@@ -136,6 +138,11 @@ def sync_item(
 
     stats = {"added": 0, "modified": 0, "removed": 0}
     has_more = True
+    # Collect the latest balance data for each account across all pages.
+    # Plaid returns the same account list on every page so later pages just
+    # overwrite earlier ones — the last write wins and represents the final
+    # balance state at sync time.
+    account_balances: dict[str, dict] = {}
 
     while has_more:
         try:
@@ -151,7 +158,9 @@ def sync_item(
             ) from exc
 
         for account in response.accounts:
-            _process_account(conn, account.to_dict(), item_id)
+            account_dict = account.to_dict()
+            _process_account(conn, account_dict, item_id)
+            account_balances[account_dict["account_id"]] = account_dict
 
         for txn in response.added:
             _process_transaction(conn, txn.to_dict(), classifier, overrides)
@@ -171,6 +180,23 @@ def sync_item(
         # Commit after each page -- cursor is durable even if next page fails
         update_item_cursor(conn, item_id, cursor)
         conn.commit()
+
+    # Write one balance snapshot per account for this sync run.
+    # All rows share the same captured_at so they collapse into a single
+    # hour-bucket in the net_worth_snapshots view.
+    captured_at = datetime.now(timezone.utc).isoformat()
+    for account_id, acct in account_balances.items():
+        balances = acct.get("balances") or {}
+        insert_balance_snapshot(
+            conn=conn,
+            account_id=account_id,
+            captured_at=captured_at,
+            current_balance=balances.get("current"),
+            available_balance=balances.get("available"),
+            limit_amount=balances.get("limit"),
+            iso_currency_code=balances.get("iso_currency_code") or "USD",
+        )
+    conn.commit()
 
     # Re-apply overrides in case any modified transactions reset their category
     apply_overrides_to_transactions(conn)

@@ -4,7 +4,8 @@ fintrack CLI -- Typer-based interface.
 Commands:
   fintrack link              Start link server to connect an institution
   fintrack sync              Sync transactions for all linked items
-  fintrack report            Monthly spending summary
+  fintrack report spending   Monthly spending summary
+  fintrack report networth   Net worth time-series from balance snapshots
   fintrack cashflow          Net cashflow (income vs expenses)
   fintrack review            Interactive review of low-confidence transactions
   fintrack push              Push data to Google Sheets
@@ -54,6 +55,9 @@ assets_app.add_typer(vehicles_app, name="vehicle")
 assets_app.add_typer(property_app, name="property")
 assets_app.add_typer(equity_app,   name="equity")
 assets_app.add_typer(account_app,  name="account")
+
+report_app = typer.Typer(help="Financial reports: spending summaries, net worth history, etc.")
+app.add_typer(report_app, name="report")
 
 adjust_app = typer.Typer(help="Saved budget normalizations (annual→monthly, one-time items, etc.)")
 app.add_typer(adjust_app, name="adjust")
@@ -167,10 +171,10 @@ def sync(item_id: Optional[str] = typer.Option(None, "--item", "-i", help="Sync 
         conn.close()
 
 
-# -- report --------------------------------------------------------------------
+# -- report -------------------------------------------------------------------
 
-@app.command()
-def report(
+@report_app.command("spending")
+def report_spending(
     month: Optional[str] = typer.Option(None, "--month", "-m", help="Month (YYYY-MM)"),
     top: int = typer.Option(10, "--top", "-t", help="Number of top merchants to show"),
 ):
@@ -236,6 +240,73 @@ def report(
                     str(row["transaction_count"]), delta,
                 )
             console.print(trend_table)
+    finally:
+        conn.close()
+
+
+@report_app.command("networth")
+def report_networth(
+    limit: int = typer.Option(30, "--limit", "-n", help="Number of snapshots to show (newest first)"),
+):
+    """
+    Show net worth over time from balance snapshots captured during sync.
+
+    Each row is one sync run (hour-bucketed). The Change column is colored
+    green when net worth increased and red when it decreased.
+    """
+    conn = _open_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT snapshot_hour, total_assets, total_liabilities, net_worth
+            FROM net_worth_snapshots
+            ORDER BY snapshot_hour DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        if not rows:
+            console.print(
+                "[yellow]No balance snapshots yet. Run [bold]fintrack sync[/] "
+                "to capture balances.[/]"
+            )
+            return
+
+        rows = list(reversed(rows))  # oldest → newest for delta calculation
+
+        t = Table(title=f"Net Worth History (last {len(rows)} sync(s))")
+        t.add_column("Date/Time")
+        t.add_column("Assets", justify="right")
+        t.add_column("Liabilities", justify="right")
+        t.add_column("Net Worth", justify="right")
+        t.add_column("Change", justify="right")
+
+        for i, row in enumerate(rows):
+            delta_str = ""
+            if i > 0:
+                delta = row["net_worth"] - rows[i - 1]["net_worth"]
+                sign = "+" if delta >= 0 else ""
+                color = "green" if delta >= 0 else "red"
+                delta_str = f"[{color}]{sign}${delta:,.2f}[/]"
+
+            nw = row["net_worth"]
+            nw_color = "green" if nw >= 0 else "red"
+            t.add_row(
+                row["snapshot_hour"][:16].replace("T", " "),
+                f"${row['total_assets']:,.2f}",
+                f"${row['total_liabilities']:,.2f}",
+                f"[{nw_color}]${nw:,.2f}[/]",
+                delta_str,
+            )
+
+        console.print(t)
+
+        latest = rows[-1]
+        nw_color = "green" if latest["net_worth"] >= 0 else "red"
+        console.print(
+            f"\n  [bold]Current Net Worth: [{nw_color}]${latest['net_worth']:,.2f}[/][/]"
+        )
     finally:
         conn.close()
 

@@ -126,6 +126,43 @@ def migrate(db_path: str) -> None:
                 notes         TEXT,
                 updated_at    TEXT NOT NULL DEFAULT (date('now'))
             );
+
+            -- One row per account per sync run.  Provides the time-series
+            -- needed for net worth trending without calling /accounts/get
+            -- separately -- the balances come from the /transactions/sync
+            -- response which already includes account data.
+            CREATE TABLE IF NOT EXISTS balance_snapshots (
+                snapshot_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id        TEXT    NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+                captured_at       TEXT    NOT NULL,
+                current_balance   REAL,
+                available_balance REAL,
+                limit_amount      REAL,
+                iso_currency_code TEXT    NOT NULL DEFAULT 'USD'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snap_account ON balance_snapshots(account_id);
+            CREATE INDEX IF NOT EXISTS idx_snap_date    ON balance_snapshots(captured_at);
+
+            -- One row per hour-bucket showing aggregated asset/liability totals.
+            -- Rounds each snapshot's captured_at to the nearest hour so that a
+            -- single sync run (all accounts captured within seconds) collapses to
+            -- one net-worth data point rather than N per-account points.
+            CREATE VIEW IF NOT EXISTS net_worth_snapshots AS
+            SELECT
+                strftime('%Y-%m-%dT%H:00:00', captured_at)       AS snapshot_hour,
+                SUM(CASE WHEN COALESCE(a.type, '') NOT IN ('credit', 'loan')
+                    THEN COALESCE(s.current_balance, 0) ELSE 0 END) AS total_assets,
+                SUM(CASE WHEN COALESCE(a.type, '') IN ('credit', 'loan')
+                    THEN COALESCE(s.current_balance, 0) ELSE 0 END) AS total_liabilities,
+                SUM(CASE WHEN COALESCE(a.type, '') NOT IN ('credit', 'loan')
+                    THEN COALESCE(s.current_balance, 0) ELSE 0 END) -
+                SUM(CASE WHEN COALESCE(a.type, '') IN ('credit', 'loan')
+                    THEN COALESCE(s.current_balance, 0) ELSE 0 END) AS net_worth
+            FROM balance_snapshots s
+            JOIN accounts a ON a.account_id = s.account_id
+            GROUP BY snapshot_hour
+            ORDER BY snapshot_hour;
         """)
         conn.commit()
 
@@ -348,6 +385,29 @@ def log_alert(conn, alert_type, message, delivered=False):
     conn.execute(
         "INSERT INTO alert_log (alert_type, message, sent_at, delivered) VALUES (?, ?, ?, ?)",
         (alert_type, message, datetime.now(timezone.utc).isoformat(), 1 if delivered else 0),
+    )
+
+
+# -- Balance snapshot helpers -------------------------------------------------
+
+def insert_balance_snapshot(
+    conn,
+    account_id: str,
+    captured_at: str,
+    current_balance: float | None,
+    available_balance: float | None,
+    limit_amount: float | None,
+    iso_currency_code: str = "USD",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO balance_snapshots
+            (account_id, captured_at, current_balance, available_balance,
+             limit_amount, iso_currency_code)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (account_id, captured_at, current_balance, available_balance,
+         limit_amount, iso_currency_code),
     )
 
 
