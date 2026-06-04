@@ -16,6 +16,7 @@ equity, and pushes analysis to Google Sheets.
 - **Google Sheets push**: Summary, Trends (cross-section heatmap), Cashflow, Transactions tabs
 - **Recurring expense detection**: auto-detect + manual list, with exclude list for false positives
 - **ntfy.sh push alerts**: large transactions, spending spikes, upcoming/missing charges, auth errors
+- **Balance snapshot history**: one row per account per sync stored in `balance_snapshots`; `net_worth_snapshots` view aggregates into hourly time-series data points
 - **Net worth tracking**: mortgage/auto loan amortization, vehicle depreciation, RSU vesting, ESPP
 - **Prophet forecasts**: monthly category-level predictions with uncertainty intervals (optional dep)
 - **Token encryption**: Fernet-encrypted access tokens at rest
@@ -110,9 +111,10 @@ Manual category overrides survive syncs.
 ### 6. View reports
 
 ```bash
-fintrack report                        # current month spending by category + merchants
+fintrack report spending               # current month spending by category + merchants
+fintrack report networth               # net worth time-series from balance snapshots
 fintrack cashflow                      # income vs expenses, net position, 6-month trend
-fintrack report --month 2026-03
+fintrack report spending --month 2026-03
 fintrack cashflow --month 2026-03 --trend 12
 ```
 
@@ -173,8 +175,10 @@ the import covers everything older.
 
 | Command | Description |
 |---|---|
-| `fintrack report` | Monthly spending by category + top merchants |
-| `fintrack report --month 2026-03 --top 20` | Specific month, more merchants |
+| `fintrack report spending` | Monthly spending by category + top merchants |
+| `fintrack report spending --month 2026-03 --top 20` | Specific month, more merchants |
+| `fintrack report networth` | Net worth time-series from balance snapshots |
+| `fintrack report networth --limit 60` | Show last 60 sync snapshots |
 | `fintrack cashflow` | Net cashflow: income minus expenses |
 | `fintrack cashflow --month 2026-03 --trend 12` | Specific month, 12-month trend |
 | `fintrack networth` | Net worth snapshot across all asset types |
@@ -491,7 +495,21 @@ transactions (transaction_id PK, account_id FK, date, amount,
 transaction_overrides (transaction_id PK, category, subcategory, note, overridden_at, override_source)
 recurring_excludes    (merchant_pattern PK, added_at)
 alert_log             (id PK, alert_type, message, sent_at, delivered)
+balance_snapshots     (snapshot_id PK, account_id FK, captured_at, current_balance,
+                       available_balance, limit_amount, iso_currency_code)
+budget_adjustments    (id PK, label, monthly_amount, category, notes, active, created_at)
+budget_targets        (category PK, target_amount, notes, updated_at)
 ```
+
+### Views
+
+```sql
+-- One row per hour-bucket; aggregates balance_snapshots into net worth time series.
+-- Assets = depository/investment/other accounts; liabilities = credit/loan accounts.
+net_worth_snapshots  (snapshot_hour, total_assets, total_liabilities, net_worth)
+```
+
+`balance_snapshots` is written automatically by `fintrack sync` — one row per account per sync run. Use `fintrack report networth` to display the time series.
 
 ### Asset tables
 

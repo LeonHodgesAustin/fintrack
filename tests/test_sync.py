@@ -16,7 +16,7 @@ import pytest
 
 from fintrack.classification import build_chain
 from fintrack.classification.base import ClassificationResult
-from fintrack.db import get_connection, insert_item, migrate, upsert_account
+from fintrack.db import get_connection, insert_balance_snapshot, insert_item, migrate, upsert_account
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -141,7 +141,15 @@ class TestDB:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert {"items", "accounts", "transactions"}.issubset(tables)
+        assert {"items", "accounts", "transactions", "balance_snapshots"}.issubset(tables)
+
+    def test_migrate_creates_net_worth_view(self, db):
+        views = {
+            r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='view'"
+            ).fetchall()
+        }
+        assert "net_worth_snapshots" in views
 
     def test_insert_item_and_retrieve(self, db):
         insert_item(db, "item-abc", "access-token-xyz", "Bank of America")
@@ -166,6 +174,58 @@ class TestDB:
         assert row["cursor"] == "cursor-abc-123"
 
 
+# ── Balance snapshot tests ────────────────────────────────────────────────────
+
+class TestBalanceSnapshots:
+    def test_insert_and_retrieve(self, seeded_db):
+        insert_balance_snapshot(
+            seeded_db, "acct-test-001", "2026-06-04T10:30:00",
+            current_balance=5000.0, available_balance=4800.0,
+            limit_amount=None, iso_currency_code="USD",
+        )
+        seeded_db.commit()
+        rows = seeded_db.execute("SELECT * FROM balance_snapshots").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["current_balance"] == 5000.0
+        assert rows[0]["iso_currency_code"] == "USD"
+
+    def test_net_worth_view_assets_minus_liabilities(self, seeded_db):
+        upsert_account(seeded_db, "acct-credit-001", "item-test-001", "Visa", "credit", "credit card")
+        seeded_db.commit()
+
+        ts = "2026-06-04T10:30:00"
+        insert_balance_snapshot(seeded_db, "acct-test-001", ts, 5000.0, 4800.0, None, "USD")
+        insert_balance_snapshot(seeded_db, "acct-credit-001", ts, 1200.0, None, 5000.0, "USD")
+        seeded_db.commit()
+
+        row = seeded_db.execute("SELECT * FROM net_worth_snapshots").fetchone()
+        assert row is not None
+        assert row["total_assets"] == 5000.0
+        assert row["total_liabilities"] == 1200.0
+        assert row["net_worth"] == pytest.approx(3800.0)
+
+    def test_net_worth_view_hour_bucketing(self, seeded_db):
+        # Two snapshots in the same hour should collapse into one view row
+        insert_balance_snapshot(seeded_db, "acct-test-001", "2026-06-04T10:05:00", 5000.0, None, None)
+        insert_balance_snapshot(seeded_db, "acct-test-001", "2026-06-04T10:50:00", 5200.0, None, None)
+        seeded_db.commit()
+
+        rows = seeded_db.execute("SELECT * FROM net_worth_snapshots").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["snapshot_hour"] == "2026-06-04T10:00:00"
+
+    def test_net_worth_view_separate_hours(self, seeded_db):
+        insert_balance_snapshot(seeded_db, "acct-test-001", "2026-06-04T10:30:00", 5000.0, None, None)
+        insert_balance_snapshot(seeded_db, "acct-test-001", "2026-06-05T11:30:00", 5200.0, None, None)
+        seeded_db.commit()
+
+        rows = seeded_db.execute(
+            "SELECT * FROM net_worth_snapshots ORDER BY snapshot_hour"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[1]["net_worth"] > rows[0]["net_worth"]
+
+
 # ── Sync unit tests (mocked Plaid client) ─────────────────────────────────────
 
 def _make_mock_txn(txn_id: str, account_id: str = "acct-test-001") -> MagicMock:
@@ -187,13 +247,24 @@ def _make_mock_txn(txn_id: str, account_id: str = "acct-test-001") -> MagicMock:
     return m
 
 
-def _make_mock_account(account_id: str = "acct-test-001") -> MagicMock:
+def _make_mock_account(
+    account_id: str = "acct-test-001",
+    balance_current: float = 5000.0,
+    balance_available: float = 4800.0,
+    account_type: str = "depository",
+) -> MagicMock:
     m = MagicMock()
     m.to_dict.return_value = {
         "account_id": account_id,
         "name": "Checking",
-        "type": "depository",
+        "type": account_type,
         "subtype": "checking",
+        "balances": {
+            "current": balance_current,
+            "available": balance_available,
+            "limit": None,
+            "iso_currency_code": "USD",
+        },
     }
     return m
 
@@ -259,6 +330,63 @@ class TestSyncUnit:
             "SELECT cursor FROM items WHERE item_id = 'item-test-001'"
         ).fetchone()
         assert cursor_row["cursor"] == "cursor-after-page-2"
+
+    def test_sync_writes_balance_snapshots(self, seeded_db):
+        from fintrack.sync import sync_item
+
+        page = MagicMock()
+        page.accounts = [_make_mock_account(balance_current=7500.0, balance_available=7000.0)]
+        page.added = []
+        page.modified = []
+        page.removed = []
+        page.next_cursor = "cursor-snap"
+        page.has_more = False
+
+        mock_client = MagicMock()
+        mock_client.transactions_sync.return_value = page
+
+        chain = build_chain(["rules"])
+        item = {"item_id": "item-test-001", "access_token": "access-sandbox-xxx", "cursor": None}
+
+        sync_item(mock_client, seeded_db, item, chain)
+
+        snaps = seeded_db.execute("SELECT * FROM balance_snapshots").fetchall()
+        assert len(snaps) == 1
+        assert snaps[0]["account_id"] == "acct-test-001"
+        assert snaps[0]["current_balance"] == 7500.0
+        assert snaps[0]["available_balance"] == 7000.0
+        assert snaps[0]["iso_currency_code"] == "USD"
+
+    def test_sync_multi_page_uses_last_balance(self, seeded_db):
+        """Later pages overwrite earlier balance data; final snapshot reflects last-seen balance."""
+        from fintrack.sync import sync_item
+
+        page1 = MagicMock()
+        page1.accounts = [_make_mock_account(balance_current=1000.0)]
+        page1.added = [_make_mock_txn("txn-p1")]
+        page1.modified = []
+        page1.removed = []
+        page1.next_cursor = "cursor-p1"
+        page1.has_more = True
+
+        page2 = MagicMock()
+        page2.accounts = [_make_mock_account(balance_current=2000.0)]
+        page2.added = []
+        page2.modified = []
+        page2.removed = []
+        page2.next_cursor = "cursor-p2"
+        page2.has_more = False
+
+        mock_client = MagicMock()
+        mock_client.transactions_sync.side_effect = [page1, page2]
+
+        chain = build_chain(["rules"])
+        item = {"item_id": "item-test-001", "access_token": "access-sandbox-xxx", "cursor": None}
+        sync_item(mock_client, seeded_db, item, chain)
+
+        snaps = seeded_db.execute("SELECT * FROM balance_snapshots").fetchall()
+        assert len(snaps) == 1
+        assert snaps[0]["current_balance"] == 2000.0
 
     def test_sync_removes_transactions(self, seeded_db):
         from fintrack.db import upsert_transaction
