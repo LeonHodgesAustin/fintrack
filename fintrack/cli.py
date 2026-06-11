@@ -2412,9 +2412,9 @@ def target_rm(
 # ══════════════════════════════════════════════════════════════════════════════
 
 TAX_CATEGORY_CHOICES = [
-    "medical", "charitable", "dependent_care", "education",
-    "home_office", "business", "investment", "alimony_paid",
-    "state_local_tax", "other",
+    "medical", "hsa_fsa", "charitable", "dependent_care", "education",
+    "self_employed", "home_office", "energy_credit", "mortgage_interest",
+    "investment", "alimony_paid", "state_local_tax", "estimated_tax", "other",
 ]
 
 
@@ -2574,7 +2574,7 @@ def tax_tag_rm(
 
 TAX_DOC_TYPE_CHOICES = [
     "W-2", "1099-INT", "1099-DIV", "1099-B", "1099-NEC",
-    "1099-MISC", "1099-R", "1098", "1098-E", "SSA-1099", "other",
+    "1099-MISC", "1099-R", "1099-SA", "1098", "1098-E", "1098-T", "SSA-1099", "other",
 ]
 
 # Account type/subtype → expected document types for a given institution.
@@ -2607,6 +2607,7 @@ def tax_docs_list(
             )
             return
 
+        import os
         received_count = sum(1 for d in docs if d["received"])
         t = Table(
             title=f"Tax Documents — {year}  "
@@ -2617,17 +2618,21 @@ def tax_docs_list(
         t.add_column("Doc Type")
         t.add_column("Received",    justify="center")
         t.add_column("Date",        style="dim")
+        t.add_column("File",        style="dim")
         t.add_column("Notes",       style="dim")
 
         for d in docs:
             recv_str = "[green]yes[/]" if d["received"] else "[yellow]waiting[/]"
+            fp = d.get("file_path")
+            file_str = os.path.basename(fp) if fp else ""
             t.add_row(
                 str(d["id"]),
                 d["institution"],
                 d["doc_type"],
                 recv_str,
                 (d["received_date"] or "")[:10],
-                (d["notes"] or "")[:40],
+                file_str[:35],
+                (d["notes"] or "")[:30],
             )
         console.print(t)
 
@@ -2792,6 +2797,205 @@ def tax_docs_rm(
             console.print(f"[green]Document #{doc_id} removed.[/]")
         else:
             console.print(f"[yellow]No document with ID {doc_id}.[/]")
+    finally:
+        conn.close()
+
+
+# Ordered most-specific first so e.g. "1098-E" matches before "1098".
+_DOC_TYPE_PATTERNS: list[tuple[str, str]] = [
+    ("w-2",      "W-2"),
+    ("w2",       "W-2"),
+    ("1099-int",  "1099-INT"),
+    ("1099int",   "1099-INT"),
+    ("1099-div",  "1099-DIV"),
+    ("1099div",   "1099-DIV"),
+    ("1099-nec",  "1099-NEC"),
+    ("1099nec",   "1099-NEC"),
+    ("1099-misc", "1099-MISC"),
+    ("1099misc",  "1099-MISC"),
+    ("1099-b",    "1099-B"),
+    ("1099b",     "1099-B"),
+    ("1099-r",    "1099-R"),
+    ("1099r",     "1099-R"),
+    ("1099-sa",   "1099-SA"),
+    ("1099sa",    "1099-SA"),
+    ("ssa-1099",  "SSA-1099"),
+    ("ssa1099",   "SSA-1099"),
+    ("1098-e",    "1098-E"),
+    ("1098e",     "1098-E"),
+    ("1098-t",    "1098-T"),
+    ("1098t",     "1098-T"),
+    ("1098",      "1098"),
+    ("1099",      "other"),   # generic unspecified 1099
+]
+
+
+def _match_doc_type(filename: str) -> str | None:
+    """Infer a tax document type from a filename. Returns None if unrecognized."""
+    fname = filename.lower()
+    for pattern, doc_type in _DOC_TYPE_PATTERNS:
+        if pattern in fname:
+            return doc_type
+    return None
+
+
+def _institution_tokens(institution: str) -> list[str]:
+    """Lower-case alpha-numeric tokens from an institution name (length >= 3)."""
+    import re
+    return [t for t in re.findall(r'[a-z0-9]+', institution.lower()) if len(t) >= 3]
+
+
+@tax_docs_app.command("scan")
+def tax_docs_scan(
+    folder: str = typer.Argument(..., help="Folder to scan (e.g. tax_documents or tax_documents/2025)"),
+    year: Optional[int] = typer.Option(
+        None, "--year", "-y",
+        help="Tax year to match against expected documents (default: current year).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Show matches without updating file_path in the database.",
+    ),
+):
+    """
+    Scan a local folder for tax document files and match them to expected entries.
+
+    Looks for common document-type keywords (W-2, 1099-INT, 1098, etc.) in
+    filenames and links matched files to their tracked entries so
+    'fintrack tax docs list' can show which expected documents have a file on disk.
+
+    Recommended folder layout (keep outside repo or add to .gitignore):
+
+      tax_documents/
+        2024/
+          W2_Employer_2024.pdf
+          1099-B_Schwab_2024.pdf
+        2025/
+          1099-INT_BofA_2025.pdf
+
+    Usage:
+      fintrack tax docs scan ./tax_documents --year 2025
+      fintrack tax docs scan ./tax_documents/2025          # year auto-detected from path
+    """
+    import os
+    from pathlib import Path
+    from collections import defaultdict
+    from .db import get_tax_documents, set_tax_document_file_path
+
+    if year is None:
+        # Try to detect year from last path component
+        last = Path(folder).name
+        if last.isdigit() and 2000 <= int(last) <= 2100:
+            year = int(last)
+        else:
+            year = date.today().year
+
+    # Resolve scan path: if folder/<year>/ exists, prefer it; else use folder directly.
+    base = Path(folder)
+    year_sub = base / str(year)
+    scan_path = year_sub if year_sub.is_dir() else base
+
+    if not scan_path.exists():
+        console.print(f"[red]Folder not found: {scan_path}[/]")
+        raise typer.Exit(1)
+
+    files = sorted(f for f in scan_path.iterdir() if f.is_file())
+    if not files:
+        console.print(f"[yellow]No files found in {scan_path}[/]")
+        return
+
+    conn = _open_db()
+    try:
+        expected = get_tax_documents(conn, year=year)
+        if not expected:
+            console.print(
+                f"[yellow]No expected documents tracked for {year}. "
+                f"Run [bold]fintrack tax docs init --year {year}[/] first.[/]"
+            )
+            return
+
+        # Group expected docs by doc_type for matching.
+        by_type: dict[str, list[dict]] = defaultdict(list)
+        for doc in expected:
+            by_type[doc["doc_type"]].append(doc)
+
+        matched_doc_ids: set[int] = set()
+        matches: list[tuple] = []   # (file, inferred_type, doc)
+        unmatched_files: list[str] = []
+
+        for f in files:
+            inferred = _match_doc_type(f.name)
+            if inferred is None:
+                unmatched_files.append(f.name)
+                continue
+
+            candidates = [
+                d for d in by_type.get(inferred, [])
+                if d["id"] not in matched_doc_ids
+            ]
+            if not candidates:
+                unmatched_files.append(f.name)
+                continue
+
+            # Prefer candidate whose institution name has a token in the filename.
+            if len(candidates) > 1:
+                fname_lower = f.name.lower()
+                inst_scored = [
+                    (sum(1 for tok in _institution_tokens(c["institution"]) if tok in fname_lower), c)
+                    for c in candidates
+                ]
+                best = max(inst_scored, key=lambda x: x[0])[1]
+            else:
+                best = candidates[0]
+
+            matched_doc_ids.add(best["id"])
+            matches.append((f.name, inferred, best, str(f)))
+
+        # Print results
+        console.print(f"\nScanned [bold]{scan_path}[/] ({len(files)} file(s)) — year {year}\n")
+
+        if matches:
+            mt = Table(title=f"Matched ({len(matches)})")
+            mt.add_column("File")
+            mt.add_column("Inferred Type")
+            mt.add_column("Institution")
+            mt.add_column("DB ID", justify="right", style="dim")
+            mt.add_column("Updated" if not dry_run else "Would update", justify="center")
+            for fname, inferred, doc, fpath in matches:
+                updated = "[dim]--[/]" if dry_run else "[green]yes[/]"
+                mt.add_row(fname[:45], inferred, doc["institution"], str(doc["id"]), updated)
+            console.print(mt)
+
+        unmatched_expected = [d for d in expected if d["id"] not in matched_doc_ids]
+        if unmatched_expected:
+            ut = Table(title=f"Expected but no file found ({len(unmatched_expected)})")
+            ut.add_column("ID", justify="right", style="dim")
+            ut.add_column("Institution")
+            ut.add_column("Doc Type")
+            ut.add_column("Received", justify="center")
+            for d in unmatched_expected:
+                recv = "[green]yes[/]" if d["received"] else "[yellow]waiting[/]"
+                ut.add_row(str(d["id"]), d["institution"], d["doc_type"], recv)
+            console.print(ut)
+
+        if unmatched_files:
+            console.print(
+                f"\n  [dim]{len(unmatched_files)} file(s) not matched to any expected document: "
+                + ", ".join(unmatched_files[:5])
+                + ("…" if len(unmatched_files) > 5 else "") + "[/]"
+            )
+
+        if not dry_run and matches:
+            for _, _, doc, fpath in matches:
+                set_tax_document_file_path(conn, doc["id"], fpath)
+            conn.commit()
+            console.print(
+                f"\n[green]Updated file_path for {len(matches)} document(s).[/] "
+                f"Run [bold]fintrack tax docs list --year {year}[/] to review."
+            )
+        elif dry_run and matches:
+            console.print("\n[dim]Dry run — no changes written.[/]")
+
     finally:
         conn.close()
 

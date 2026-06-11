@@ -16,7 +16,15 @@ import pytest
 
 from fintrack.classification import build_chain
 from fintrack.classification.base import ClassificationResult
-from fintrack.db import get_connection, insert_balance_snapshot, insert_item, migrate, upsert_account
+from fintrack.db import (
+    get_connection, insert_balance_snapshot, insert_item, migrate, upsert_account,
+    add_flag, get_all_flags, FLAG_TYPES,
+    TAX_CATEGORIES, TAX_DOC_TYPES,
+    add_tax_tag, remove_tax_tag, get_tax_tags,
+    upsert_tax_document, mark_tax_document_received, get_tax_documents,
+    get_tax_document, set_tax_document_file_path,
+)
+from fintrack.reports import monthly_summary, flagged_in_period
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -226,6 +234,91 @@ class TestBalanceSnapshots:
         assert rows[1]["net_worth"] > rows[0]["net_worth"]
 
 
+# ── Transaction flag tests ────────────────────────────────────────────────────
+
+@pytest.fixture()
+def txn_db(seeded_db):
+    """seeded_db with two transactions for flag/report tests."""
+    from fintrack.db import upsert_transaction
+    upsert_transaction(
+        seeded_db, "txn-flight", "acct-test-001", "2026-06-01", 450.0,
+        "Delta Airlines", "DELTA AIR", "TRAVEL", "", 0.9, "rules", False, "{}",
+    )
+    upsert_transaction(
+        seeded_db, "txn-groceries", "acct-test-001", "2026-06-05", 120.0,
+        "Whole Foods", "WHOLE FOODS", "FOOD_AND_DRINK", "", 0.9, "rules", False, "{}",
+    )
+    seeded_db.commit()
+    return seeded_db
+
+
+class TestTransactionFlags:
+    def test_flag_types_constant(self):
+        assert set(FLAG_TYPES) == {"one-time", "reimbursable", "gift", "transfer", "other"}
+
+    def test_add_flag_returns_id(self, txn_db):
+        fid = add_flag(txn_db, "txn-flight", "one-time", "uncle 70th birthday")
+        txn_db.commit()
+        assert isinstance(fid, int) and fid > 0
+
+    def test_get_all_flags_joins_transaction(self, txn_db):
+        add_flag(txn_db, "txn-flight", "one-time", "birthday trip")
+        txn_db.commit()
+        flags = get_all_flags(txn_db)
+        assert len(flags) == 1
+        assert flags[0]["merchant"] == "Delta Airlines"
+        assert flags[0]["flag_type"] == "one-time"
+        assert flags[0]["note"] == "birthday trip"
+        assert flags[0]["amount"] == 450.0
+
+    def test_check_constraint_rejects_bad_type(self, txn_db):
+        import sqlite3
+        with pytest.raises(sqlite3.IntegrityError):
+            txn_db.execute(
+                "INSERT INTO transaction_flags (transaction_id, flag_type) VALUES (?, ?)",
+                ("txn-flight", "invalid-type"),
+            )
+
+    def test_monthly_summary_exclude_flagged(self, txn_db):
+        add_flag(txn_db, "txn-flight", "one-time")
+        txn_db.commit()
+
+        full = monthly_summary(txn_db, 2026, 6)
+        norm = monthly_summary(txn_db, 2026, 6, exclude_flagged=True)
+
+        full_total = sum(r["total_amount"] for r in full)
+        norm_total = sum(r["total_amount"] for r in norm)
+
+        assert full_total == pytest.approx(570.0)
+        assert norm_total == pytest.approx(120.0)
+
+    def test_monthly_summary_unflagged_unchanged(self, txn_db):
+        # exclude_flagged=False (default) returns same totals regardless of flags
+        add_flag(txn_db, "txn-flight", "gift")
+        txn_db.commit()
+        without = monthly_summary(txn_db, 2026, 6, exclude_flagged=False)
+        assert sum(r["total_amount"] for r in without) == pytest.approx(570.0)
+
+    def test_flagged_in_period_count_and_sum(self, txn_db):
+        add_flag(txn_db, "txn-flight", "reimbursable", "expensed to work")
+        txn_db.commit()
+        fi = flagged_in_period(txn_db, 2026, 6)
+        assert fi["count"] == 1
+        assert fi["total_amount"] == pytest.approx(450.0)
+
+    def test_flagged_in_period_zero_when_no_flags(self, txn_db):
+        fi = flagged_in_period(txn_db, 2026, 6)
+        assert fi["count"] == 0
+        assert fi["total_amount"] == pytest.approx(0.0)
+
+    def test_flagged_in_period_ignores_other_months(self, txn_db):
+        add_flag(txn_db, "txn-flight", "one-time")
+        txn_db.commit()
+        # query a different month — should see nothing
+        fi = flagged_in_period(txn_db, 2026, 5)
+        assert fi["count"] == 0
+
+
 # ── Sync unit tests (mocked Plaid client) ─────────────────────────────────────
 
 def _make_mock_txn(txn_id: str, account_id: str = "acct-test-001") -> MagicMock:
@@ -422,6 +515,206 @@ class TestSyncUnit:
             "SELECT * FROM transactions WHERE transaction_id = 'txn-to-delete'"
         ).fetchone()
         assert row is None
+
+
+# ── Tax tag tests ─────────────────────────────────────────────────────────────
+
+class TestTaxTags:
+    def test_categories_constant_has_expected_values(self):
+        for cat in ("medical", "hsa_fsa", "charitable", "dependent_care", "education",
+                    "self_employed", "home_office", "energy_credit", "mortgage_interest",
+                    "investment", "alimony_paid", "state_local_tax", "estimated_tax", "other"):
+            assert cat in TAX_CATEGORIES, f"Missing category: {cat}"
+
+    def test_add_and_retrieve(self, txn_db):
+        tag_id = add_tax_tag(txn_db, "txn-flight", "medical", 2026, "eye exam")
+        txn_db.commit()
+        tags = get_tax_tags(txn_db)
+        assert len(tags) == 1
+        assert tags[0]["tag_id"] == tag_id
+        assert tags[0]["tax_category"] == "medical"
+        assert tags[0]["tax_year"] == 2026
+        assert tags[0]["note"] == "eye exam"
+        assert tags[0]["amount"] == pytest.approx(450.0)
+        assert tags[0]["merchant"] == "Delta Airlines"
+
+    def test_filter_by_year(self, txn_db):
+        add_tax_tag(txn_db, "txn-flight",    "medical",    2026)
+        add_tax_tag(txn_db, "txn-groceries", "charitable", 2025)
+        txn_db.commit()
+        tags_2026 = get_tax_tags(txn_db, year=2026)
+        assert len(tags_2026) == 1
+        assert tags_2026[0]["tax_category"] == "medical"
+
+    def test_filter_by_category(self, txn_db):
+        add_tax_tag(txn_db, "txn-flight",    "medical",    2026)
+        add_tax_tag(txn_db, "txn-groceries", "charitable", 2026)
+        txn_db.commit()
+        med = get_tax_tags(txn_db, tax_category="medical")
+        assert len(med) == 1
+        char = get_tax_tags(txn_db, tax_category="charitable")
+        assert len(char) == 1
+
+    def test_filter_by_year_and_category(self, txn_db):
+        add_tax_tag(txn_db, "txn-flight",    "medical",    2026)
+        add_tax_tag(txn_db, "txn-groceries", "medical",    2025)
+        txn_db.commit()
+        results = get_tax_tags(txn_db, year=2026, tax_category="medical")
+        assert len(results) == 1
+
+    def test_remove_tag(self, txn_db):
+        tag_id = add_tax_tag(txn_db, "txn-flight", "dependent_care", 2026)
+        txn_db.commit()
+        ok = remove_tax_tag(txn_db, tag_id)
+        txn_db.commit()
+        assert ok is True
+        assert get_tax_tags(txn_db) == []
+
+    def test_remove_nonexistent_returns_false(self, txn_db):
+        assert remove_tax_tag(txn_db, 9999) is False
+
+    def test_tag_deleted_when_transaction_deleted(self, txn_db):
+        add_tax_tag(txn_db, "txn-flight", "medical", 2026)
+        txn_db.commit()
+        txn_db.execute("DELETE FROM transactions WHERE transaction_id = 'txn-flight'")
+        txn_db.commit()
+        assert get_tax_tags(txn_db) == []
+
+
+# ── Tax document tests ────────────────────────────────────────────────────────
+
+class TestTaxDocuments:
+    def test_doc_types_constant_has_expected_values(self):
+        for dt in ("W-2", "1099-INT", "1099-DIV", "1099-B", "1099-SA", "1098", "1098-T"):
+            assert dt in TAX_DOC_TYPES, f"Missing doc type: {dt}"
+
+    def test_upsert_and_retrieve(self, db):
+        doc_id = upsert_tax_document(db, 2025, "Bank of America", "1099-INT")
+        db.commit()
+        docs = get_tax_documents(db, year=2025)
+        assert len(docs) == 1
+        assert docs[0]["id"] == doc_id
+        assert docs[0]["institution"] == "Bank of America"
+        assert docs[0]["doc_type"] == "1099-INT"
+        assert docs[0]["received"] == 0
+        assert docs[0]["file_path"] is None
+
+    def test_mark_received(self, db):
+        doc_id = upsert_tax_document(db, 2025, "Schwab", "1099-B")
+        db.commit()
+        ok = mark_tax_document_received(db, doc_id, True, "2026-02-15")
+        db.commit()
+        assert ok is True
+        doc = get_tax_document(db, doc_id)
+        assert doc["received"] == 1
+        assert doc["received_date"] == "2026-02-15"
+
+    def test_mark_not_received(self, db):
+        doc_id = upsert_tax_document(db, 2025, "Schwab", "1099-B")
+        mark_tax_document_received(db, doc_id, True, "2026-01-31")
+        mark_tax_document_received(db, doc_id, False, None)
+        db.commit()
+        doc = get_tax_document(db, doc_id)
+        assert doc["received"] == 0
+
+    def test_upsert_idempotent(self, db):
+        upsert_tax_document(db, 2025, "Schwab", "1099-DIV")
+        upsert_tax_document(db, 2025, "Schwab", "1099-DIV")
+        db.commit()
+        docs = get_tax_documents(db, year=2025)
+        assert len(docs) == 1
+
+    def test_filter_by_year(self, db):
+        upsert_tax_document(db, 2025, "BofA", "1099-INT")
+        upsert_tax_document(db, 2024, "BofA", "1099-INT")
+        db.commit()
+        assert len(get_tax_documents(db, year=2025)) == 1
+        assert len(get_tax_documents(db, year=2024)) == 1
+        assert len(get_tax_documents(db)) == 2
+
+    def test_file_path_column_exists(self, db):
+        doc_id = upsert_tax_document(db, 2025, "IRS", "W-2")
+        db.commit()
+        row = db.execute("SELECT file_path FROM tax_documents WHERE id=?", (doc_id,)).fetchone()
+        assert row is not None
+        assert row["file_path"] is None
+
+    def test_set_file_path(self, db):
+        doc_id = upsert_tax_document(db, 2025, "Employer", "W-2")
+        db.commit()
+        ok = set_tax_document_file_path(db, doc_id, "/docs/tax/W2_2025.pdf")
+        db.commit()
+        assert ok is True
+        doc = get_tax_document(db, doc_id)
+        assert doc["file_path"] == "/docs/tax/W2_2025.pdf"
+
+    def test_set_file_path_nonexistent_returns_false(self, db):
+        assert set_tax_document_file_path(db, 9999, "/foo.pdf") is False
+
+
+# ── Doc scan filename-matching tests ─────────────────────────────────────────
+
+class TestDocScanMatching:
+    """Tests for the _match_doc_type filename-matching helper."""
+
+    def _match(self, filename: str) -> str | None:
+        from fintrack.cli import _match_doc_type
+        return _match_doc_type(filename)
+
+    def test_w2_hyphenated(self):
+        assert self._match("W-2_Cisco_2025.pdf") == "W-2"
+
+    def test_w2_no_hyphen(self):
+        assert self._match("W2_Employer_2025.pdf") == "W-2"
+
+    def test_w2_uppercase(self):
+        assert self._match("2025_W2.PDF") == "W-2"
+
+    def test_1099_int(self):
+        assert self._match("1099-INT_BofA_2025.pdf") == "1099-INT"
+        assert self._match("1099int_bofa.pdf") == "1099-INT"
+
+    def test_1099_div(self):
+        assert self._match("1099-DIV_Schwab.pdf") == "1099-DIV"
+        assert self._match("schwab_1099div_2025.pdf") == "1099-DIV"
+
+    def test_1099_b(self):
+        assert self._match("1099-B Proceeds 2025.pdf") == "1099-B"
+        assert self._match("consolidated_1099b.pdf") == "1099-B"
+
+    def test_1099_nec(self):
+        assert self._match("1099-NEC_freelance.pdf") == "1099-NEC"
+
+    def test_1099_r(self):
+        assert self._match("1099-R_retirement.pdf") == "1099-R"
+
+    def test_1099_sa(self):
+        assert self._match("1099-SA_HSA_2025.pdf") == "1099-SA"
+
+    def test_ssa_1099(self):
+        assert self._match("SSA-1099_2025.pdf") == "SSA-1099"
+        assert self._match("ssa1099.pdf") == "SSA-1099"
+
+    def test_1098_mortgage(self):
+        assert self._match("1098_mortgage_interest.pdf") == "1098"
+        assert self._match("MidIsland_1098_2025.PDF") == "1098"
+
+    def test_1098_e_before_1098(self):
+        assert self._match("1098-E Student Loan.pdf") == "1098-E"
+        assert self._match("1098e_sallie_mae.pdf") == "1098-E"
+
+    def test_1098_t_before_1098(self):
+        assert self._match("1098-T_University.pdf") == "1098-T"
+        assert self._match("1098t_tuition.pdf") == "1098-T"
+
+    def test_no_match_returns_none(self):
+        assert self._match("random_document.pdf") is None
+        assert self._match("prior_year_return_2024.pdf") is None
+        assert self._match("receipt_dentist.jpg") is None
+
+    def test_case_insensitive(self):
+        assert self._match("FORM_W-2_2025.PDF") == "W-2"
+        assert self._match("1099-INT_BOFA.PDF") == "1099-INT"
 
 
 # ── Sandbox integration tests (require real credentials) ──────────────────────

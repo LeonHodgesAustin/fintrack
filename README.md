@@ -496,8 +496,9 @@ fintrack tax tag txn-xyz789 --category medical         --note "vision exam + gla
 fintrack tax tag txn-def456 --category charitable      --note "Red Cross donation"
 
 # Available categories:
-#   medical, charitable, dependent_care, education, home_office,
-#   business, investment, alimony_paid, state_local_tax, other
+#   medical, hsa_fsa, charitable, dependent_care, education,
+#   self_employed, home_office, energy_credit, mortgage_interest,
+#   investment, alimony_paid, state_local_tax, estimated_tax, other
 
 # List all tagged transactions (optionally filter by year or category)
 fintrack tax tag list --year 2025
@@ -541,7 +542,34 @@ fintrack tax docs rm <id>
 ```
 
 Available document types: `W-2`, `1099-INT`, `1099-DIV`, `1099-B`, `1099-NEC`,
-`1099-MISC`, `1099-R`, `1098`, `1098-E`, `SSA-1099`, `other`.
+`1099-MISC`, `1099-R`, `1099-SA`, `1098`, `1098-E`, `1098-T`, `SSA-1099`, `other`.
+
+### Scan local document folder
+
+Keep actual PDF files in a local folder (outside the repo, or gitignored). Suggested layout:
+
+```
+tax_documents/
+  2025/
+    W-2_Employer_2025.pdf
+    1099-B_Schwab_2025.pdf
+    1099-INT_BofA_2025.pdf
+```
+
+Add `tax_documents/` to `.gitignore` — document files should not be committed.
+
+```powershell
+# Match files against expected entries; updates file_path in DB
+fintrack tax docs scan ./tax_documents --year 2025
+fintrack tax docs scan ./tax_documents/2025  # year auto-detected from last path component
+
+# Preview without writing
+fintrack tax docs scan ./tax_documents --year 2025 --dry-run
+```
+
+The scanner recognizes doc-type keywords in filenames (W-2/W2, 1099-INT, 1099-B,
+1098, 1098-E, SSA-1099, etc.) and records the matched file path in the database so
+`fintrack tax docs list` shows a `File` column alongside each expected document.
 
 ### Reference info
 

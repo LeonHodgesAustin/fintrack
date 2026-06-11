@@ -45,6 +45,96 @@
 
 ---
 
+## HSA / FSA
+
+- **HSA (Health Savings Account)**: Contributions are pre-tax (or deductible if made
+  outside payroll). Distributions for qualified medical expenses are tax-free. The
+  custodian will send **Form 1099-SA** for distributions; contributions via payroll
+  show up on your W-2.
+  - Use `fintrack tax tag <txn_id> --category hsa_fsa` for medical expenses paid
+    from your HSA/FSA so you can reconcile them.
+- **FSA**: Use-it-or-lose-it employer accounts. Contributions are pre-tax via payroll
+  (on your W-2). Usually no 1099 issued unless there's a distribution event.
+- Keep receipts for all HSA/FSA-reimbursed expenses — the IRS can ask.
+
+---
+
+## Self-Employed / 1099 / Side Work (Schedule C)
+
+If you have freelance income, consulting, or side work reported on a 1099-NEC, you file
+Schedule C. Key deductions:
+
+- **Home office** (Form 8829 or simplified method): Only for a space used *regularly
+  and exclusively* for business. W-2 employees generally cannot claim this since
+  TCJA 2017 eliminated the employee home office deduction — it applies to self-employed.
+- **Equipment, software, subscriptions**: Direct business costs are deductible.
+- **Phone and internet**: If used partly for business, you can deduct the business
+  portion (requires good records of usage split).
+- **Vehicle mileage**: Business miles at the IRS standard mileage rate (67¢/mile for
+  2024; verify for the current year). Keep a mileage log.
+- **Health insurance premiums**: Self-employed health insurance deduction (above-the-line,
+  not just Schedule C).
+- Use `fintrack tax tag <txn_id> --category self_employed` for all 1099-related
+  business expenses. Tag home office costs separately with `--category home_office`.
+
+> **Reminder**: self-employment tax (SE tax) is roughly 15.3% on net self-employment
+> income. The deduction for half of SE tax offsets this somewhat.
+
+---
+
+## Energy-Efficient Home Improvement Credits
+
+Two main credits under the Inflation Reduction Act (extended through at least 2032):
+
+### Energy Efficient Home Improvement Credit (Form 5695, §25C)
+- Up to **30% of cost**, capped at $1,200/year total (with some sub-limits per category).
+- Qualifying items: heat pumps (up to $2,000 cap separately), insulation/air sealing,
+  exterior windows/skylights, exterior doors, energy audits, central A/C, water heaters.
+- Requires the item to meet specific efficiency standards (ask the installer for the
+  Manufacturer Certification Statement).
+
+### Residential Clean Energy Credit (Form 5695, §25D)
+- **30% of cost** for solar panels, solar water heaters, battery storage, geothermal
+  heat pumps, fuel cells.
+- No dollar cap; carries forward if it exceeds your tax liability.
+
+### EV Tax Credit (§30D / §25E)
+- New EVs: up to $7,500 (subject to vehicle MSRP and buyer income limits).
+- Used EVs: up to $4,000 or 30% of price, whichever is less.
+- EV charger installation: up to **30% of cost** (§30C), capped at $1,000 for residential.
+
+Use `fintrack tax tag <txn_id> --category energy_credit` for any of these purchases.
+
+---
+
+## Mortgage Interest and Property Taxes
+
+### Mortgage Interest (Form 1098)
+- Deductible if you itemize. Your lender sends Form 1098 showing interest paid.
+- `fintrack tax docs init` will add a 1098 tracker for mortgage accounts linked via
+  Plaid; add your servicer manually if it isn't linked.
+- Use `fintrack tax tag <txn_id> --category mortgage_interest` if you want to track
+  individual payment transactions.
+
+### Property Taxes
+- Deductible as part of SALT (state and local taxes), capped at $10,000 combined with
+  state income/sales tax.
+- Use `fintrack tax tag <txn_id> --category state_local_tax` for property tax payments.
+
+---
+
+## Estimated Tax Payments
+
+- If you have self-employment income, investment gains, or other non-W-2 income, you
+  may owe quarterly estimated taxes (IRS Form 1040-ES), due April/June/September/January.
+- Payments made via IRS Direct Pay or state portals show up as debits — tag them:
+  `fintrack tax tag <txn_id> --category estimated_tax`
+- These reduce your balance due (or increase your refund) at filing time.
+- The IRS safe-harbor rule: you avoid underpayment penalties if you pay at least 90%
+  of current-year tax OR 100% of prior-year tax (110% if prior-year AGI > $150,000).
+
+---
+
 ## Multiple Brokerage Accounts
 
 You have accounts at Schwab, Stash, and possibly E*Trade. Things to watch:
@@ -74,6 +164,45 @@ You have accounts at Schwab, Stash, and possibly E*Trade. Things to watch:
 
 ---
 
+## Education Expenses
+
+### American Opportunity Credit (AOTC)
+- Up to $2,500/year per eligible student in the first four years of higher education.
+- 40% refundable. Requires Form 1098-T from the institution.
+
+### Lifetime Learning Credit (LLC)
+- Up to $2,000/year (20% of up to $10,000 in expenses). Not refundable.
+- Available for any year of education, including graduate courses and professional
+  development.
+
+### 529 Withdrawals
+- Federal income-tax-free when used for qualifying education expenses. Some states
+  also offer a deduction on contributions.
+- Use `fintrack tax tag <txn_id> --category education` to track tuition/fees/books.
+
+---
+
+## Items NOT Worth Tracking (Common Misconceptions)
+
+### Job Search / Moving Expenses
+- **Job search costs** (resume prep, recruiters, travel for interviews) are **not**
+  federally deductible for employees under TCJA (2017 through at least 2025). Don't
+  waste time tracking them.
+- **Moving expenses** for employees are similarly **not** deductible federally under
+  TCJA. The exception is active-duty military moves; everyone else doesn't get it.
+
+### Personal Legal Fees
+- Generally not deductible. Attorney fees related to a divorce are personal expenses
+  (not deductible), though fees for tax advice within the divorce context may be
+  partially deductible — ask your attorney to itemize the bill.
+
+### Unreimbursed Employee Expenses
+- W-2 employees cannot deduct unreimbursed job expenses (tools, uniforms, home office)
+  federally under TCJA. If your employer doesn't reimburse via an accountable plan,
+  those costs are simply out-of-pocket.
+
+---
+
 ## Other Items to Review
 
 ### Large One-Time Purchases
@@ -83,28 +212,23 @@ You have accounts at Schwab, Stash, and possibly E*Trade. Things to watch:
     of income tax — useful in a year with large purchases)
   - Home improvement basis (if you own a home, keep records for when you sell)
 - Use `fintrack flag <txn_id> --type one-time` to mark large one-time items and
-  `fintrack tax tag <txn_id> --category other` if you want to flag them for review.
+  `fintrack tax tag <txn_id> --category other` if you want to flag them for tax review.
 
 ### Medical Expenses
 - Deductible only if you itemize, and only the portion exceeding 7.5% of AGI.
-- Still worth tracking: counts toward an FSA/HSA reconciliation, and enough
-  medical spend can push you over the threshold.
+- Still worth tracking: counts toward HSA reconciliation, and enough spend can push
+  you over the threshold.
 - Use `fintrack tax tag <txn_id> --category medical --note "..."`.
 
 ### Charitable Donations
 - Cash donations to qualifying 501(c)(3) organizations are deductible if you itemize.
-- Non-cash donations (clothing, household goods) require a receipt from the charity
-  and, for items over $500, IRS Form 8283.
+- Non-cash donations (clothing, household goods) require a receipt and, for items
+  over $500, IRS Form 8283.
 - Use `fintrack tax tag <txn_id> --category charitable`.
-
-### Mortgage Interest (if applicable)
-- If you have a mortgage, Form 1098 from your lender shows deductible interest.
-- `fintrack tax docs init` will add a 1098 tracker for any mortgage-type accounts
-  linked via Plaid. Add your servicer manually if it isn't linked.
 
 ### Student Loan Interest
 - Up to $2,500 of student loan interest may be deductible (income phase-outs apply),
-  without needing to itemize. Your lender will send Form 1098-E.
+  without needing to itemize. Your lender sends Form 1098-E.
 
 ---
 
@@ -122,6 +246,39 @@ standard deduction often wins — but run the numbers.
 
 ---
 
+## Local Document Archive
+
+Keep actual PDF documents (W-2s, 1099s, prior-year returns) in a local folder
+**outside this repo** (or add `tax_documents/` to your `.gitignore`). Suggested layout:
+
+```
+tax_documents/
+  2024/
+    W2_Employer_2024.pdf
+    1099-B_Schwab_2024.pdf
+    1099-INT_BofA_2024.pdf
+  2025/
+    1099-INT_BofA_2025.pdf
+    1099-B_Schwab_consolidated_2025.pdf
+    W-2_Cisco_2025.pdf
+```
+
+Use `fintrack tax docs scan` to link files to expected entries:
+
+```powershell
+fintrack tax docs scan ./tax_documents --year 2025
+fintrack tax docs scan ./tax_documents/2025    # year auto-detected from path
+
+# Preview without writing to DB
+fintrack tax docs scan ./tax_documents --year 2025 --dry-run
+```
+
+The scanner matches on keywords in filenames (W-2/W2, 1099-INT, 1099-B, 1098, etc.)
+and records the file path in the database. `fintrack tax docs list` will then show
+the linked filename alongside each expected document.
+
+---
+
 ## Useful fintrack Commands for Tax Season
 
 ```powershell
@@ -136,6 +293,10 @@ fintrack report tax-summary --year 2025 --detail
 
 # Check which documents you're still waiting on
 fintrack tax docs list --year 2025
+
+# Scan local folder for document files
+fintrack tax docs scan ./tax_documents --year 2025
+fintrack tax docs scan ./tax_documents/2025
 
 # Mark a document received
 fintrack tax docs mark <id> --received
@@ -164,6 +325,8 @@ Common expected documents:
 | Stash             | 1099-DIV, 1099-B, 1099-INT | Check app/email |
 | E*Trade           | 1099-DIV, 1099-B, 1099-INT | Includes ESPP supplemental statement |
 | Mortgage servicer | 1098         | Mortgage interest; add manually if servicer isn't in Plaid |
+| HSA custodian     | 1099-SA      | HSA distributions; add if you have an HSA |
+| University / school | 1098-T     | Tuition; add if claiming education credits |
 
 ---
 

@@ -222,6 +222,7 @@ def migrate(db_path: str) -> None:
         # Additive migrations for existing DBs
         for stmt in [
             "ALTER TABLE items ADD COLUMN error_state TEXT",
+            "ALTER TABLE tax_documents ADD COLUMN file_path TEXT",
         ]:
             try:
                 conn.execute(stmt)
@@ -575,16 +576,20 @@ def remove_flag(conn, flag_id: int) -> bool:
 
 
 TAX_CATEGORIES: tuple[str, ...] = (
-    "medical",        # medical/dental/vision, prescriptions, health insurance premiums
-    "charitable",     # charitable donations (cash, goods, or mileage)
-    "dependent_care", # childcare, summer camp, before/after-school (Form 2441)
-    "education",      # tuition, course fees, books, student loan interest
-    "home_office",    # home office expenses (if self-employed or qualified remote work)
-    "business",       # unreimbursed business expenses
-    "investment",     # investment advisory fees, related expenses
-    "alimony_paid",   # alimony paid (only deductible for divorces finalized before 2019)
-    "state_local_tax", # state/local income or property tax payments (SALT)
-    "other",          # anything else flagged for tax review
+    "medical",         # medical/dental/vision, prescriptions, health insurance premiums
+    "hsa_fsa",         # HSA/FSA contributions and qualified expenses paid from those accounts
+    "charitable",      # charitable donations (cash, goods, or mileage)
+    "dependent_care",  # childcare, summer camp, before/after-school (Form 2441)
+    "education",       # tuition, course fees, books, 529 contributions, student loan interest
+    "self_employed",   # Schedule C expenses: 1099/freelance/side-work income & business costs
+    "home_office",     # home office deduction (primarily for self-employed; see tax_notes.md)
+    "energy_credit",   # energy-efficient improvements: heat pump, solar, EV charger, insulation
+    "mortgage_interest", # mortgage interest paid (Form 1098 deduction if itemizing)
+    "investment",      # investment advisory fees, related deductible expenses
+    "alimony_paid",    # alimony paid (deductible only for divorces finalized before 2019)
+    "state_local_tax", # state/local income or property tax payments (SALT deduction)
+    "estimated_tax",   # federal or state quarterly estimated tax payments made
+    "other",           # anything else flagged for tax review
 )
 
 TAX_DOC_TYPES: tuple[str, ...] = (
@@ -595,8 +600,10 @@ TAX_DOC_TYPES: tuple[str, ...] = (
     "1099-NEC",
     "1099-MISC",
     "1099-R",
+    "1099-SA",   # HSA distributions
     "1098",
     "1098-E",
+    "1098-T",    # tuition statement
     "SSA-1099",
     "other",
 )
@@ -752,7 +759,8 @@ def get_tax_documents(conn, year: int | None = None) -> list[dict]:
     params = [year] if year is not None else []
     rows = conn.execute(
         f"""
-        SELECT id, year, institution, doc_type, received, received_date, notes, created_at
+        SELECT id, year, institution, doc_type, received, received_date,
+               notes, file_path, created_at
         FROM tax_documents
         {where}
         ORDER BY year DESC, institution, doc_type
@@ -760,6 +768,13 @@ def get_tax_documents(conn, year: int | None = None) -> list[dict]:
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_tax_document_file_path(conn, doc_id: int, file_path: str | None) -> bool:
+    cur = conn.execute(
+        "UPDATE tax_documents SET file_path = ? WHERE id = ?", (file_path, doc_id)
+    )
+    return cur.rowcount > 0
 
 
 def get_tax_document(conn, doc_id: int) -> dict | None:
