@@ -24,15 +24,23 @@ def monthly_summary(
     year: int,
     month: int,
     exclude_pending: bool = True,
+    exclude_flagged: bool = False,
 ) -> list[dict]:
     """
     Spending by category for a given month.
 
     Returns a list of dicts sorted by total_amount descending:
       [{category, total_amount, transaction_count}, ...]
+
+    When exclude_flagged=True, transactions with a row in transaction_flags
+    are omitted from all totals.
     """
     start, end = _month_bounds(year, month)
     pending_filter = "AND pending = 0" if exclude_pending else ""
+    flagged_filter = (
+        "AND transaction_id NOT IN (SELECT transaction_id FROM transaction_flags)"
+        if exclude_flagged else ""
+    )
 
     rows = conn.execute(
         f"""
@@ -43,6 +51,7 @@ def monthly_summary(
         FROM transactions
         WHERE date >= ? AND date < ? AND amount > 0
               {pending_filter}
+              {flagged_filter}
         GROUP BY category_primary
         ORDER BY total_amount DESC
         """,
@@ -50,6 +59,35 @@ def monthly_summary(
     ).fetchall()
 
     return [dict(r) for r in rows]
+
+
+def flagged_in_period(
+    conn: sqlite3.Connection,
+    year: int,
+    month: int,
+    exclude_pending: bool = True,
+) -> dict:
+    """
+    Count and sum of flagged transactions with positive amounts in the period.
+
+    Returns {count, total_amount} — both are 0 when no flagged transactions exist.
+    """
+    start, end = _month_bounds(year, month)
+    pending_filter = "AND t.pending = 0" if exclude_pending else ""
+
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*)                        AS count,
+            COALESCE(SUM(t.amount), 0.0)    AS total_amount
+        FROM transactions t
+        JOIN transaction_flags f ON f.transaction_id = t.transaction_id
+        WHERE t.date >= ? AND t.date < ? AND t.amount > 0
+              {pending_filter}
+        """,
+        (start, end),
+    ).fetchone()
+    return dict(row)
 
 
 def top_merchants(
@@ -157,6 +195,60 @@ def recent_transactions(
     ).fetchall()
 
     return [dict(r) for r in rows]
+
+
+def tax_summary(
+    conn: sqlite3.Connection,
+    year: int,
+) -> list[dict]:
+    """
+    Spending totals grouped by tax_category for a given tax year.
+
+    Returns [{tax_category, total_amount, transaction_count,
+              transactions: [{date, merchant, amount, note}, ...]}, ...]
+    sorted by total_amount descending.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            tt.tax_category,
+            SUM(t.amount)  AS total_amount,
+            COUNT(*)       AS transaction_count
+        FROM tax_tags tt
+        JOIN transactions t ON t.transaction_id = tt.transaction_id
+        WHERE tt.tax_year = ?
+        GROUP BY tt.tax_category
+        ORDER BY total_amount DESC
+        """,
+        (year,),
+    ).fetchall()
+
+    summary = []
+    for r in rows:
+        cat = r["tax_category"]
+        txn_rows = conn.execute(
+            """
+            SELECT
+                t.date,
+                COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant,
+                t.amount,
+                tt.note,
+                tt.tag_id
+            FROM tax_tags tt
+            JOIN transactions t ON t.transaction_id = tt.transaction_id
+            WHERE tt.tax_year = ? AND tt.tax_category = ?
+            ORDER BY t.date DESC
+            """,
+            (year, cat),
+        ).fetchall()
+        summary.append({
+            "tax_category": cat,
+            "total_amount": r["total_amount"],
+            "transaction_count": r["transaction_count"],
+            "transactions": [dict(tr) for tr in txn_rows],
+        })
+
+    return summary
 
 
 def category_trends(

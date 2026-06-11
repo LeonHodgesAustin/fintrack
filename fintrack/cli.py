@@ -6,6 +6,8 @@ Commands:
   fintrack sync              Sync transactions for all linked items
   fintrack report spending   Monthly spending summary
   fintrack report networth   Net worth time-series from balance snapshots
+  fintrack flag <txn_id>     Flag a transaction as out-of-band
+  fintrack flag list         Show all flagged transactions
   fintrack cashflow          Net cashflow (income vs expenses)
   fintrack review            Interactive review of low-confidence transactions
   fintrack push              Push data to Google Sheets
@@ -59,11 +61,23 @@ assets_app.add_typer(account_app,  name="account")
 report_app = typer.Typer(help="Financial reports: spending summaries, net worth history, etc.")
 app.add_typer(report_app, name="report")
 
+flag_app = typer.Typer(help="Flag transactions as out-of-band (one-time, reimbursable, gift, etc.).")
+app.add_typer(flag_app, name="flag")
+
 adjust_app = typer.Typer(help="Saved budget normalizations (annual→monthly, one-time items, etc.)")
 app.add_typer(adjust_app, name="adjust")
 
 target_app = typer.Typer(help="Per-category monthly spending targets.")
 app.add_typer(target_app, name="target")
+
+tax_app      = typer.Typer(help="Tax-prep helpers: tag transactions, track documents, store reference info.")
+tax_tag_app  = typer.Typer(help="Tag transactions with tax categories for year-end reporting.")
+tax_docs_app = typer.Typer(help="Track expected and received tax documents (W-2, 1099s, etc.).")
+tax_info_app = typer.Typer(help="Store static tax reference info (EIN, prior-year AGI, etc.).")
+app.add_typer(tax_app,  name="tax")
+tax_app.add_typer(tax_tag_app,  name="tag")
+tax_app.add_typer(tax_docs_app, name="docs")
+tax_app.add_typer(tax_info_app, name="info")
 
 console = Console()
 
@@ -177,9 +191,13 @@ def sync(item_id: Optional[str] = typer.Option(None, "--item", "-i", help="Sync 
 def report_spending(
     month: Optional[str] = typer.Option(None, "--month", "-m", help="Month (YYYY-MM)"),
     top: int = typer.Option(10, "--top", "-t", help="Number of top merchants to show"),
+    exclude_flagged: bool = typer.Option(
+        False, "--exclude-flagged",
+        help="Omit flagged transactions from totals and show both raw and normalized spend.",
+    ),
 ):
     """Print a monthly spending summary to stdout."""
-    from .reports import monthly_summary, top_merchants, mom_trends
+    from .reports import monthly_summary, top_merchants, mom_trends, flagged_in_period
     if month:
         try:
             year, mon = (int(x) for x in month.split("-"))
@@ -192,12 +210,17 @@ def report_spending(
 
     conn = _open_db()
     try:
-        summary = monthly_summary(conn, year, mon)
+        flagged_info = flagged_in_period(conn, year, mon) if exclude_flagged else None
+        summary = monthly_summary(conn, year, mon, exclude_flagged=exclude_flagged)
         total = sum(r["total_amount"] for r in summary)
+
+        footer_label = f"${total:,.2f}"
+        if flagged_info and flagged_info["count"]:
+            footer_label += f"  [dim](normalized)[/]"
 
         cat_table = Table(title=f"Spending by Category -- {year}-{mon:02d}", show_footer=True)
         cat_table.add_column("Category")
-        cat_table.add_column("Amount", justify="right", footer=f"${total:,.2f}")
+        cat_table.add_column("Amount", justify="right", footer=footer_label)
         cat_table.add_column("Txns", justify="right")
         cat_table.add_column("%", justify="right")
         for row in summary:
@@ -207,6 +230,18 @@ def report_spending(
                 str(row["transaction_count"]), f"{pct:.1f}%",
             )
         console.print(cat_table)
+
+        if flagged_info and flagged_info["count"]:
+            raw_total = total + flagged_info["total_amount"]
+            console.print(
+                f"  [dim]Raw total (incl. {flagged_info['count']} flagged txn(s)): "
+                f"${raw_total:,.2f}[/]"
+            )
+            console.print(
+                f"  [green]Normalized spend (excl. {flagged_info['count']} flagged): "
+                f"${total:,.2f}[/]  "
+                f"[dim](${flagged_info['total_amount']:,.2f} excluded)[/]"
+            )
 
         merchants = top_merchants(conn, year, mon, limit=top)
         if merchants:
@@ -307,6 +342,198 @@ def report_networth(
         console.print(
             f"\n  [bold]Current Net Worth: [{nw_color}]${latest['net_worth']:,.2f}[/][/]"
         )
+    finally:
+        conn.close()
+
+
+@report_app.command("tax-summary")
+def report_tax_summary(
+    year: int = typer.Option(
+        None, "--year", "-y",
+        help="Tax year to summarize (default: current calendar year)",
+    ),
+    detail: bool = typer.Option(False, "--detail", "-d", help="Show individual transactions per category"),
+):
+    """
+    Yearly spending totals grouped by tax category.
+
+    Shows totals for every category you have tagged with 'fintrack tax tag'.
+    Use --detail to list individual transactions under each category.
+
+      fintrack report tax-summary --year 2025
+      fintrack report tax-summary --year 2025 --detail
+    """
+    from .reports import tax_summary
+
+    if year is None:
+        year = date.today().year
+
+    conn = _open_db()
+    try:
+        rows = tax_summary(conn, year)
+        if not rows:
+            console.print(
+                f"[yellow]No tax-tagged transactions for {year}. "
+                f"Use [bold]fintrack tax tag <txn_id>[/] to tag transactions.[/]"
+            )
+            return
+
+        total = sum(r["total_amount"] for r in rows)
+        t = Table(title=f"Tax Summary — {year}  (${total:,.2f} total tagged)", show_footer=True)
+        t.add_column("Category")
+        t.add_column("Amount", justify="right", footer=f"${total:,.2f}")
+        t.add_column("Txns", justify="right")
+        t.add_column("Notes / Examples", style="dim")
+
+        for r in rows:
+            example_notes = ", ".join(
+                filter(None, [tx.get("note") for tx in r["transactions"][:2]])
+            )
+            t.add_row(
+                r["tax_category"],
+                f"${r['total_amount']:,.2f}",
+                str(r["transaction_count"]),
+                example_notes[:50],
+            )
+        console.print(t)
+
+        if detail:
+            for r in rows:
+                dt = Table(title=f"  {r['tax_category']} — ${r['total_amount']:,.2f}", box=None)
+                dt.add_column("Tag #", justify="right", style="dim")
+                dt.add_column("Date")
+                dt.add_column("Merchant")
+                dt.add_column("Amount", justify="right")
+                dt.add_column("Note", style="dim")
+                for tx in r["transactions"]:
+                    dt.add_row(
+                        str(tx["tag_id"]),
+                        tx["date"],
+                        (tx["merchant"] or "")[:40],
+                        f"${tx['amount']:,.2f}",
+                        (tx["note"] or "")[:40],
+                    )
+                console.print(dt)
+    finally:
+        conn.close()
+
+
+# -- flag ---------------------------------------------------------------------
+
+FLAG_TYPE_CHOICES = ["one-time", "reimbursable", "gift", "transfer", "other"]
+
+
+@flag_app.callback(invoke_without_command=True)
+def flag_add(
+    ctx: typer.Context,
+    transaction_id: Optional[str] = typer.Argument(
+        None, help="Transaction ID to flag (from 'fintrack report spending' or the DB)."
+    ),
+    type_: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help=f"Flag type: {', '.join(FLAG_TYPE_CHOICES)}",
+    ),
+    note: Optional[str] = typer.Option(
+        None, "--note", "-n", help="Optional explanation, e.g. 'uncle 70th birthday flight'."
+    ),
+):
+    """
+    Flag a transaction as out-of-band so it can be excluded from spending reports.
+
+      fintrack flag txn-abc123 --type one-time --note "wedding gift"
+      fintrack flag txn-abc123 --type reimbursable --note "expensed to work"
+
+    Use 'fintrack flag list' to review all flagged transactions.
+    Use 'fintrack report spending --exclude-flagged' to see spend without them.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    if not transaction_id:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
+
+    if not type_:
+        console.print(f"[red]--type is required. Choices: {', '.join(FLAG_TYPE_CHOICES)}[/]")
+        raise typer.Exit(1)
+
+    if type_ not in FLAG_TYPE_CHOICES:
+        console.print(
+            f"[red]Unknown flag type '{type_}'. "
+            f"Valid types: {', '.join(FLAG_TYPE_CHOICES)}[/]"
+        )
+        raise typer.Exit(1)
+
+    from .db import add_flag, FLAG_TYPES
+
+    conn = _open_db()
+    try:
+        txn = conn.execute(
+            """
+            SELECT t.transaction_id, t.date, t.amount,
+                   COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant
+            FROM transactions t
+            WHERE t.transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+
+        if not txn:
+            console.print(f"[red]Transaction '{transaction_id}' not found.[/]")
+            raise typer.Exit(1)
+
+        flag_id = add_flag(conn, transaction_id, type_, note)
+        conn.commit()
+
+        console.print(
+            f"[green]Flagged[/] [bold]{txn['merchant']}[/] "
+            f"(${txn['amount']:,.2f} on {txn['date']}) "
+            f"as [bold]{type_}[/] [dim][flag #{flag_id}][/]"
+        )
+        if note:
+            console.print(f"  Note: {note}")
+    finally:
+        conn.close()
+
+
+@flag_app.command("list")
+def flag_list():
+    """Show all flagged transactions."""
+    from .db import get_all_flags
+
+    conn = _open_db()
+    try:
+        flags = get_all_flags(conn)
+        if not flags:
+            console.print(
+                "[dim]No flagged transactions. "
+                "Use [bold]fintrack flag <txn_id> --type <type>[/] to add one.[/]"
+            )
+            return
+
+        t = Table(title=f"Flagged Transactions ({len(flags)} total)")
+        t.add_column("Flag #", justify="right", style="dim")
+        t.add_column("Date")
+        t.add_column("Merchant")
+        t.add_column("Amount", justify="right")
+        t.add_column("Type")
+        t.add_column("Note", style="dim")
+        t.add_column("Transaction ID", style="dim")
+
+        for f in flags:
+            t.add_row(
+                str(f["flag_id"]),
+                f["date"],
+                (f["merchant"] or "")[:35],
+                f"${f['amount']:,.2f}",
+                f["flag_type"],
+                (f["note"] or "")[:40],
+                f["transaction_id"][:20] + "…" if len(f["transaction_id"]) > 20 else f["transaction_id"],
+            )
+
+        console.print(t)
+        total_flagged = sum(f["amount"] for f in flags)
+        console.print(f"\n  Total flagged spend: [bold]${total_flagged:,.2f}[/]")
     finally:
         conn.close()
 
@@ -2176,5 +2403,471 @@ def target_rm(
             console.print(f"[green]Target for {category.upper()} removed.[/]")
         else:
             console.print(f"[yellow]No target found for {category.upper()}.[/]")
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fintrack tax tag
+# ══════════════════════════════════════════════════════════════════════════════
+
+TAX_CATEGORY_CHOICES = [
+    "medical", "charitable", "dependent_care", "education",
+    "home_office", "business", "investment", "alimony_paid",
+    "state_local_tax", "other",
+]
+
+
+@tax_tag_app.callback(invoke_without_command=True)
+def tax_tag_add(
+    ctx: typer.Context,
+    transaction_id: Optional[str] = typer.Argument(
+        None, help="Transaction ID to tag (from report spending or the DB)."
+    ),
+    category: Optional[str] = typer.Option(
+        None, "--category", "-c",
+        help=f"Tax category: {', '.join(TAX_CATEGORY_CHOICES)}",
+    ),
+    note: Optional[str] = typer.Option(
+        None, "--note", "-n",
+        help="Optional note, e.g. 'summer camp for son', 'vision exam + glasses'.",
+    ),
+    year: Optional[int] = typer.Option(
+        None, "--year", "-y",
+        help="Override tax year (default: taken from transaction date).",
+    ),
+):
+    """
+    Tag a transaction with a tax category so it appears in 'fintrack report tax-summary'.
+
+      fintrack tax tag txn-abc123 --category dependent_care --note "echo hill summer camp"
+      fintrack tax tag txn-xyz789 --category medical         --note "vision exam + glasses"
+      fintrack tax tag txn-def456 --category charitable      --note "Red Cross donation"
+
+    Run 'fintrack tax tag list' to review all tagged transactions.
+    Run 'fintrack report tax-summary --year 2025' for a year-end rollup.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    if not transaction_id:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
+
+    if not category:
+        console.print(f"[red]--category is required. Choices: {', '.join(TAX_CATEGORY_CHOICES)}[/]")
+        raise typer.Exit(1)
+
+    if category not in TAX_CATEGORY_CHOICES:
+        console.print(
+            f"[red]Unknown category '{category}'. "
+            f"Valid choices: {', '.join(TAX_CATEGORY_CHOICES)}[/]"
+        )
+        raise typer.Exit(1)
+
+    from .db import add_tax_tag
+
+    conn = _open_db()
+    try:
+        txn = conn.execute(
+            """
+            SELECT t.transaction_id, t.date, t.amount,
+                   COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant
+            FROM transactions t
+            WHERE t.transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+
+        if not txn:
+            console.print(f"[red]Transaction '{transaction_id}' not found.[/]")
+            raise typer.Exit(1)
+
+        tax_year = year if year is not None else int(txn["date"][:4])
+        tag_id = add_tax_tag(conn, transaction_id, category, tax_year, note)
+        conn.commit()
+
+        console.print(
+            f"[green]Tagged[/] [bold]{txn['merchant']}[/] "
+            f"(${txn['amount']:,.2f} on {txn['date']}) "
+            f"as [bold]{category}[/] for tax year [bold]{tax_year}[/] "
+            f"[dim][tag #{tag_id}][/]"
+        )
+        if note:
+            console.print(f"  Note: {note}")
+    finally:
+        conn.close()
+
+
+@tax_tag_app.command("list")
+def tax_tag_list(
+    year: Optional[int] = typer.Option(None, "--year", "-y", help="Filter by tax year"),
+    category: Optional[str] = typer.Option(None, "--category", "-c", help="Filter by tax category"),
+):
+    """Show all tax-tagged transactions."""
+    from .db import get_tax_tags
+
+    conn = _open_db()
+    try:
+        tags = get_tax_tags(conn, year=year, tax_category=category)
+        if not tags:
+            filter_str = ""
+            if year:
+                filter_str += f" for {year}"
+            if category:
+                filter_str += f" in {category}"
+            console.print(
+                f"[dim]No tax-tagged transactions{filter_str}. "
+                f"Use [bold]fintrack tax tag <txn_id> --category <cat>[/] to add one.[/]"
+            )
+            return
+
+        t = Table(title=f"Tax-Tagged Transactions ({len(tags)} total)")
+        t.add_column("Tag #", justify="right", style="dim")
+        t.add_column("Year", justify="right")
+        t.add_column("Date")
+        t.add_column("Merchant")
+        t.add_column("Amount", justify="right")
+        t.add_column("Category")
+        t.add_column("Note", style="dim")
+
+        for tag in tags:
+            t.add_row(
+                str(tag["tag_id"]),
+                str(tag["tax_year"]),
+                tag["date"],
+                (tag["merchant"] or "")[:35],
+                f"${tag['amount']:,.2f}",
+                tag["tax_category"],
+                (tag["note"] or "")[:40],
+            )
+        console.print(t)
+
+        total = sum(t_["amount"] for t_ in tags)
+        console.print(f"\n  Total tagged spend: [bold]${total:,.2f}[/]")
+    finally:
+        conn.close()
+
+
+@tax_tag_app.command("rm")
+def tax_tag_rm(
+    tag_id: int = typer.Argument(..., help="Tag ID from 'fintrack tax tag list'"),
+):
+    """Remove a tax tag from a transaction."""
+    from .db import remove_tax_tag
+
+    conn = _open_db()
+    try:
+        ok = remove_tax_tag(conn, tag_id)
+        conn.commit()
+        if ok:
+            console.print(f"[green]Tax tag #{tag_id} removed.[/]")
+        else:
+            console.print(f"[yellow]No tag with ID {tag_id}.[/]")
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fintrack tax docs
+# ══════════════════════════════════════════════════════════════════════════════
+
+TAX_DOC_TYPE_CHOICES = [
+    "W-2", "1099-INT", "1099-DIV", "1099-B", "1099-NEC",
+    "1099-MISC", "1099-R", "1098", "1098-E", "SSA-1099", "other",
+]
+
+# Account type/subtype → expected document types for a given institution.
+_ACCOUNT_DOC_MAP: dict[str, list[str]] = {
+    "investment": ["1099-DIV", "1099-B", "1099-INT"],
+    "brokerage":  ["1099-DIV", "1099-B", "1099-INT"],
+    "depository": ["1099-INT"],
+    "mortgage":   ["1098"],   # matched against subtype
+}
+
+
+@tax_docs_app.command("list")
+def tax_docs_list(
+    year: Optional[int] = typer.Option(None, "--year", "-y", help="Filter by year (default: current year)"),
+):
+    """List expected and received tax documents."""
+    from .db import get_tax_documents
+
+    if year is None:
+        year = date.today().year
+
+    conn = _open_db()
+    try:
+        docs = get_tax_documents(conn, year=year)
+        if not docs:
+            console.print(
+                f"[yellow]No documents tracked for {year}. "
+                f"Run [bold]fintrack tax docs init --year {year}[/] to pre-populate "
+                f"from linked institutions, or [bold]fintrack tax docs add[/] to add manually.[/]"
+            )
+            return
+
+        received_count = sum(1 for d in docs if d["received"])
+        t = Table(
+            title=f"Tax Documents — {year}  "
+                  f"({received_count}/{len(docs)} received)"
+        )
+        t.add_column("ID",          justify="right", style="dim")
+        t.add_column("Institution")
+        t.add_column("Doc Type")
+        t.add_column("Received",    justify="center")
+        t.add_column("Date",        style="dim")
+        t.add_column("Notes",       style="dim")
+
+        for d in docs:
+            recv_str = "[green]yes[/]" if d["received"] else "[yellow]waiting[/]"
+            t.add_row(
+                str(d["id"]),
+                d["institution"],
+                d["doc_type"],
+                recv_str,
+                (d["received_date"] or "")[:10],
+                (d["notes"] or "")[:40],
+            )
+        console.print(t)
+
+        missing = [d for d in docs if not d["received"]]
+        if missing:
+            console.print(
+                f"\n  [yellow]{len(missing)} document(s) not yet received.[/] "
+                f"Run [bold]fintrack tax docs mark <id> --received[/] when they arrive."
+            )
+    finally:
+        conn.close()
+
+
+@tax_docs_app.command("add")
+def tax_docs_add(
+    year: int = typer.Option(..., "--year", "-y", help="Tax year (e.g. 2025)"),
+    institution: str = typer.Option(..., "--institution", "-i", help="Institution name (e.g. 'Bank of America')"),
+    doc_type: str = typer.Option(..., "--doc-type", "-d",
+                                 help=f"Document type: {', '.join(TAX_DOC_TYPE_CHOICES)}"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n"),
+):
+    """Add a tax document to track."""
+    from .db import upsert_tax_document
+
+    conn = _open_db()
+    try:
+        doc_id = upsert_tax_document(conn, year, institution, doc_type, notes)
+        conn.commit()
+        console.print(
+            f"[green]Added[/] {doc_type} from [bold]{institution}[/] "
+            f"for {year} [dim][#{doc_id}][/]"
+        )
+    finally:
+        conn.close()
+
+
+@tax_docs_app.command("mark")
+def tax_docs_mark(
+    doc_id: int = typer.Argument(..., help="Document ID from 'fintrack tax docs list'"),
+    received: bool = typer.Option(True, "--received/--not-received",
+                                  help="Mark as received (default) or not received"),
+    received_date: Optional[str] = typer.Option(
+        None, "--date", "-d",
+        help="Date received YYYY-MM-DD (default: today)",
+    ),
+):
+    """Mark a tax document as received (or not received)."""
+    from .db import mark_tax_document_received, get_tax_document
+
+    conn = _open_db()
+    try:
+        doc = get_tax_document(conn, doc_id)
+        if not doc:
+            console.print(f"[red]Document #{doc_id} not found.[/]")
+            raise typer.Exit(1)
+
+        recv_date = received_date or (date.today().isoformat() if received else None)
+        mark_tax_document_received(conn, doc_id, received, recv_date)
+        conn.commit()
+
+        if received:
+            console.print(
+                f"[green]Marked received:[/] {doc['doc_type']} from [bold]{doc['institution']}[/] "
+                f"({doc['year']})  [dim]{recv_date}[/]"
+            )
+        else:
+            console.print(
+                f"[yellow]Marked not received:[/] {doc['doc_type']} from {doc['institution']}"
+            )
+    finally:
+        conn.close()
+
+
+@tax_docs_app.command("init")
+def tax_docs_init(
+    year: int = typer.Option(..., "--year", "-y", help="Tax year to initialize (e.g. 2025)"),
+):
+    """
+    Pre-populate expected tax documents from linked Plaid institutions.
+
+    Looks at each linked institution's account types and suggests likely 1099s:
+      - Depository accounts   → 1099-INT
+      - Investment/brokerage  → 1099-DIV, 1099-B, 1099-INT
+      - Mortgage loan         → 1098
+
+    Run 'fintrack tax docs add' to add a W-2 from your employer manually,
+    since employer info is not tracked in Plaid.
+    """
+    from .db import upsert_tax_document
+
+    conn = _open_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT i.institution_name, a.type, a.subtype
+            FROM items i
+            JOIN accounts a ON a.item_id = i.item_id
+            ORDER BY i.institution_name
+            """
+        ).fetchall()
+
+        if not rows:
+            console.print("[yellow]No linked institutions found. Run [bold]fintrack link[/] first.[/]")
+            return
+
+        inserted = 0
+        skipped  = 0
+        seen: set[tuple[str, str]] = set()
+
+        for row in rows:
+            institution = row["institution_name"]
+            acct_type   = (row["type"]    or "").lower()
+            acct_sub    = (row["subtype"] or "").lower()
+
+            doc_types: list[str] = []
+            if acct_type in ("investment",) or acct_sub in ("brokerage", "investment"):
+                doc_types = ["1099-DIV", "1099-B", "1099-INT"]
+            elif acct_type == "depository":
+                doc_types = ["1099-INT"]
+            elif acct_sub == "mortgage":
+                doc_types = ["1098"]
+
+            for dt in doc_types:
+                key = (institution, dt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                doc_id = conn.execute(
+                    "SELECT id FROM tax_documents WHERE year=? AND institution=? AND doc_type=?",
+                    (year, institution, dt),
+                ).fetchone()
+                if doc_id:
+                    skipped += 1
+                else:
+                    upsert_tax_document(conn, year, institution, dt)
+                    inserted += 1
+                    console.print(f"  [green]+[/] {institution}: {dt}")
+
+        conn.commit()
+        console.print(
+            f"\n[bold]Done.[/] Added {inserted} document(s). "
+            f"{skipped} already existed.\n"
+            f"  [dim]Don't forget to add your employer W-2 manually:[/]\n"
+            f"  fintrack tax docs add --year {year} --institution \"Employer\" --doc-type W-2"
+        )
+    finally:
+        conn.close()
+
+
+@tax_docs_app.command("rm")
+def tax_docs_rm(
+    doc_id: int = typer.Argument(..., help="Document ID from 'fintrack tax docs list'"),
+):
+    """Remove a tracked document entry."""
+    from .db import delete_tax_document
+
+    conn = _open_db()
+    try:
+        ok = delete_tax_document(conn, doc_id)
+        conn.commit()
+        if ok:
+            console.print(f"[green]Document #{doc_id} removed.[/]")
+        else:
+            console.print(f"[yellow]No document with ID {doc_id}.[/]")
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fintrack tax info
+# ══════════════════════════════════════════════════════════════════════════════
+
+@tax_info_app.command("set")
+def tax_info_set(
+    key:   str = typer.Argument(..., help="Key name (e.g. employer_ein, prior_year_agi)"),
+    value: str = typer.Argument(..., help="Value to store"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Optional reminder note"),
+):
+    """
+    Store a piece of static tax reference info as a key-value pair.
+
+    Examples:
+      fintrack tax info set employer_ein 12-3456789
+      fintrack tax info set prior_year_agi 95000
+      fintrack tax info set schwab_acct_last4 4321
+      fintrack tax info set filing_status "head of household (verify with CPA)"
+
+    WARNING: do NOT store full SSNs, full account numbers, or other
+    complete sensitive identifiers. Last 4 digits are fine for reference.
+    """
+    from .db import set_tax_info
+
+    conn = _open_db()
+    try:
+        set_tax_info(conn, key, value, notes)
+        conn.commit()
+        console.print(f"[green]Set[/] [bold]{key}[/] = {value}" + (f"  [dim]({notes})[/]" if notes else ""))
+    finally:
+        conn.close()
+
+
+@tax_info_app.command("list")
+def tax_info_list():
+    """Show all stored tax reference info."""
+    from .db import get_all_tax_info
+
+    conn = _open_db()
+    try:
+        rows = get_all_tax_info(conn)
+        if not rows:
+            console.print(
+                "[dim]No tax info stored. Use [bold]fintrack tax info set <key> <value>[/] to add.[/]"
+            )
+            return
+        t = Table(title="Tax Reference Info", box=None)
+        t.add_column("Key",      justify="left")
+        t.add_column("Value",    justify="left")
+        t.add_column("Notes",    justify="left", style="dim")
+        t.add_column("Updated",  justify="left", style="dim")
+        for r in rows:
+            t.add_row(r["key"], r["value"], r["notes"] or "", r["updated_at"][:10])
+        console.print(t)
+    finally:
+        conn.close()
+
+
+@tax_info_app.command("rm")
+def tax_info_rm(
+    key: str = typer.Argument(..., help="Key to remove"),
+):
+    """Remove a tax info entry."""
+    from .db import delete_tax_info
+
+    conn = _open_db()
+    try:
+        ok = delete_tax_info(conn, key)
+        conn.commit()
+        if ok:
+            console.print(f"[green]Removed tax info key '{key}'.[/]")
+        else:
+            console.print(f"[yellow]No entry with key '{key}'.[/]")
     finally:
         conn.close()

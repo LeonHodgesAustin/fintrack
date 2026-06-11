@@ -9,6 +9,7 @@ equity, and pushes analysis to Google Sheets.
 
 ## Features
 
+- **Tax-prep layer**: tag transactions by tax category (medical, charitable, dependent care, etc.), track expected/received tax documents (W-2, 1099s), and store static reference info (EIN, prior-year AGI)
 - **Plaid `/transactions/sync`** with per-page cursor persistence — never re-fetches from scratch
 - **Layered classifier pipeline**: regex rules → Plaid categories → LLM (slot ready)
 - **Manual override system**: fix misclassified transactions via CLI or Google Sheets
@@ -481,6 +482,87 @@ pytest -m sandbox              # integration tests (requires .env with sandbox k
 
 ---
 
+## Tax Prep
+
+Tag transactions, track documents, and store reference info for year-end filing.
+See [docs/tax_notes.md](docs/tax_notes.md) for a general checklist and gotchas.
+
+### Tagging transactions
+
+```powershell
+# Tag a transaction with a tax category
+fintrack tax tag txn-abc123 --category dependent_care --note "echo hill summer camp"
+fintrack tax tag txn-xyz789 --category medical         --note "vision exam + glasses"
+fintrack tax tag txn-def456 --category charitable      --note "Red Cross donation"
+
+# Available categories:
+#   medical, charitable, dependent_care, education, home_office,
+#   business, investment, alimony_paid, state_local_tax, other
+
+# List all tagged transactions (optionally filter by year or category)
+fintrack tax tag list --year 2025
+fintrack tax tag list --year 2025 --category dependent_care
+
+# Remove a tag
+fintrack tax tag rm <tag_id>
+```
+
+### Tax summary report
+
+```powershell
+# Totals by category for the year
+fintrack report tax-summary --year 2025
+
+# With individual transactions listed under each category
+fintrack report tax-summary --year 2025 --detail
+```
+
+### Document tracker
+
+```powershell
+# Auto-populate expected docs from linked Plaid institutions
+fintrack tax docs init --year 2025
+
+# Add a document manually (e.g., W-2 from employer)
+fintrack tax docs add --year 2025 --institution "Cisco" --doc-type W-2
+
+# List all expected/received documents
+fintrack tax docs list --year 2025
+
+# Mark a document received (date defaults to today)
+fintrack tax docs mark <id> --received
+fintrack tax docs mark <id> --received --date 2026-01-31
+
+# Mark not received (e.g., to correct a mistake)
+fintrack tax docs mark <id> --not-received
+
+# Remove a document entry
+fintrack tax docs rm <id>
+```
+
+Available document types: `W-2`, `1099-INT`, `1099-DIV`, `1099-B`, `1099-NEC`,
+`1099-MISC`, `1099-R`, `1098`, `1098-E`, `SSA-1099`, `other`.
+
+### Reference info
+
+```powershell
+# Store static reference info for filing season
+fintrack tax info set employer_ein 12-3456789
+fintrack tax info set prior_year_agi 95000
+fintrack tax info set schwab_acct_last4 4321  # last 4 only — never full account numbers
+
+# List all stored info
+fintrack tax info list
+
+# Remove an entry
+fintrack tax info rm employer_ein
+```
+
+> **Security note**: Do NOT store full SSNs, full account numbers, or complete
+> sensitive identifiers in `tax info`. Last 4 digits are fine for reference.
+
+---
+
 ## Database Schema
 
 ### Transaction tables
@@ -499,6 +581,9 @@ balance_snapshots     (snapshot_id PK, account_id FK, captured_at, current_balan
                        available_balance, limit_amount, iso_currency_code)
 budget_adjustments    (id PK, label, monthly_amount, category, notes, active, created_at)
 budget_targets        (category PK, target_amount, notes, updated_at)
+tax_tags              (tag_id PK, transaction_id FK, tax_category, note, tax_year, created_at)
+tax_documents         (id PK, year, institution, doc_type, received, received_date, notes, created_at)
+tax_info              (key PK, value, notes, updated_at)
 ```
 
 ### Views

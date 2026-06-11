@@ -119,6 +119,19 @@ def migrate(db_path: str) -> None:
                 created_at     TEXT NOT NULL DEFAULT (date('now'))
             );
 
+            -- Out-of-band expense flags: one-time, reimbursable, gift, etc.
+            -- flag_type is validated at the application layer (FLAG_TYPES constant)
+            -- and by the CHECK constraint here as a second line of defence.
+            CREATE TABLE IF NOT EXISTS transaction_flags (
+                flag_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT    NOT NULL REFERENCES transactions(transaction_id) ON DELETE CASCADE,
+                flag_type      TEXT    NOT NULL CHECK(flag_type IN ('one-time','reimbursable','gift','transfer','other')),
+                note           TEXT,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_flag_txn ON transaction_flags(transaction_id);
+
             -- Per-category spending targets shown alongside actuals.
             CREATE TABLE IF NOT EXISTS budget_targets (
                 category      TEXT PRIMARY KEY,
@@ -143,6 +156,46 @@ def migrate(db_path: str) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_snap_account ON balance_snapshots(account_id);
             CREATE INDEX IF NOT EXISTS idx_snap_date    ON balance_snapshots(captured_at);
+
+            -- Tax-prep: tag a transaction with a tax category (medical, charitable, etc.)
+            -- Tax year defaults to the calendar year of the transaction date.
+            CREATE TABLE IF NOT EXISTS tax_tags (
+                tag_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT    NOT NULL REFERENCES transactions(transaction_id) ON DELETE CASCADE,
+                tax_category   TEXT    NOT NULL,
+                note           TEXT,
+                tax_year       INTEGER NOT NULL,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tax_tag_txn  ON tax_tags(transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_tax_tag_year ON tax_tags(tax_year);
+            CREATE INDEX IF NOT EXISTS idx_tax_tag_cat  ON tax_tags(tax_category);
+
+            -- Tax-prep: track expected and received tax documents per year.
+            CREATE TABLE IF NOT EXISTS tax_documents (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                year          INTEGER NOT NULL,
+                institution   TEXT    NOT NULL,
+                doc_type      TEXT    NOT NULL,
+                received      INTEGER NOT NULL DEFAULT 0,
+                received_date TEXT,
+                notes         TEXT,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(year, institution, doc_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tax_doc_year ON tax_documents(year);
+
+            -- Tax-prep: key/value store for static reference info (EIN, prior-year AGI, etc.)
+            -- WARNING: do NOT store full SSNs or full account numbers here.
+            -- Last 4 digits only is acceptable for identification purposes.
+            CREATE TABLE IF NOT EXISTS tax_info (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                notes      TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
 
             -- One row per hour-bucket showing aggregated asset/liability totals.
             -- Rounds each snapshot's captured_at to the nearest hour so that a
@@ -491,4 +544,264 @@ def remove_budget_target(conn, category: str) -> bool:
     cur = conn.execute(
         "DELETE FROM budget_targets WHERE category = ?", (category,)
     )
+    return cur.rowcount > 0
+
+
+# -- Transaction flag helpers -------------------------------------------------
+
+FLAG_TYPES: tuple[str, ...] = ("one-time", "reimbursable", "gift", "transfer", "other")
+
+
+def add_flag(
+    conn,
+    transaction_id: str,
+    flag_type: str,
+    note: str | None = None,
+) -> int:
+    """Flag a transaction. Returns the new flag_id."""
+    cur = conn.execute(
+        """
+        INSERT INTO transaction_flags (transaction_id, flag_type, note)
+        VALUES (?, ?, ?)
+        """,
+        (transaction_id, flag_type, note),
+    )
+    return cur.lastrowid
+
+
+def remove_flag(conn, flag_id: int) -> bool:
+    cur = conn.execute("DELETE FROM transaction_flags WHERE flag_id = ?", (flag_id,))
+    return cur.rowcount > 0
+
+
+TAX_CATEGORIES: tuple[str, ...] = (
+    "medical",        # medical/dental/vision, prescriptions, health insurance premiums
+    "charitable",     # charitable donations (cash, goods, or mileage)
+    "dependent_care", # childcare, summer camp, before/after-school (Form 2441)
+    "education",      # tuition, course fees, books, student loan interest
+    "home_office",    # home office expenses (if self-employed or qualified remote work)
+    "business",       # unreimbursed business expenses
+    "investment",     # investment advisory fees, related expenses
+    "alimony_paid",   # alimony paid (only deductible for divorces finalized before 2019)
+    "state_local_tax", # state/local income or property tax payments (SALT)
+    "other",          # anything else flagged for tax review
+)
+
+TAX_DOC_TYPES: tuple[str, ...] = (
+    "W-2",
+    "1099-INT",
+    "1099-DIV",
+    "1099-B",
+    "1099-NEC",
+    "1099-MISC",
+    "1099-R",
+    "1098",
+    "1098-E",
+    "SSA-1099",
+    "other",
+)
+
+
+def get_all_flags(conn) -> list[dict]:
+    """Return all flags joined with transaction data, newest-first by transaction date."""
+    rows = conn.execute(
+        """
+        SELECT
+            f.flag_id,
+            f.transaction_id,
+            f.flag_type,
+            f.note,
+            f.created_at,
+            t.date,
+            t.amount,
+            COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant,
+            t.category_primary
+        FROM transaction_flags f
+        JOIN transactions t ON t.transaction_id = f.transaction_id
+        ORDER BY t.date DESC, f.created_at DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# -- Tax tag helpers ----------------------------------------------------------
+
+def add_tax_tag(
+    conn,
+    transaction_id: str,
+    tax_category: str,
+    tax_year: int,
+    note: str | None = None,
+) -> int:
+    """Tag a transaction with a tax category. Returns the new tag_id."""
+    cur = conn.execute(
+        """
+        INSERT INTO tax_tags (transaction_id, tax_category, tax_year, note)
+        VALUES (?, ?, ?, ?)
+        """,
+        (transaction_id, tax_category, tax_year, note),
+    )
+    return cur.lastrowid
+
+
+def remove_tax_tag(conn, tag_id: int) -> bool:
+    cur = conn.execute("DELETE FROM tax_tags WHERE tag_id = ?", (tag_id,))
+    return cur.rowcount > 0
+
+
+def get_tax_tags(conn, year: int | None = None, tax_category: str | None = None) -> list[dict]:
+    """Return tax-tagged transactions, joined with transaction data.
+
+    Filters by year and/or category when provided.
+    """
+    filters = []
+    params: list = []
+    if year is not None:
+        filters.append("tt.tax_year = ?")
+        params.append(year)
+    if tax_category is not None:
+        filters.append("tt.tax_category = ?")
+        params.append(tax_category)
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            tt.tag_id,
+            tt.transaction_id,
+            tt.tax_category,
+            tt.tax_year,
+            tt.note,
+            tt.created_at,
+            t.date,
+            t.amount,
+            COALESCE(t.merchant_name, t.raw_name, 'Unknown') AS merchant,
+            t.category_primary
+        FROM tax_tags tt
+        JOIN transactions t ON t.transaction_id = tt.transaction_id
+        {where}
+        ORDER BY tt.tax_year DESC, t.date DESC
+        """,
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# -- Tax document helpers -----------------------------------------------------
+
+def add_tax_document(
+    conn,
+    year: int,
+    institution: str,
+    doc_type: str,
+    notes: str | None = None,
+) -> int | None:
+    """Insert a new expected document. Returns tag_id, or None if already exists."""
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO tax_documents (year, institution, doc_type, notes)
+            VALUES (?, ?, ?, ?)
+            """,
+            (year, institution, doc_type, notes),
+        )
+        return cur.lastrowid
+    except Exception:
+        return None
+
+
+def upsert_tax_document(
+    conn,
+    year: int,
+    institution: str,
+    doc_type: str,
+    notes: str | None = None,
+) -> int:
+    """Insert or update a tax document entry. Returns the row id."""
+    conn.execute(
+        """
+        INSERT INTO tax_documents (year, institution, doc_type, notes)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(year, institution, doc_type) DO UPDATE SET
+            notes = COALESCE(excluded.notes, notes)
+        """,
+        (year, institution, doc_type, notes),
+    )
+    row = conn.execute(
+        "SELECT id FROM tax_documents WHERE year=? AND institution=? AND doc_type=?",
+        (year, institution, doc_type),
+    ).fetchone()
+    return row["id"]
+
+
+def mark_tax_document_received(
+    conn,
+    doc_id: int,
+    received: bool,
+    received_date: str | None = None,
+) -> bool:
+    cur = conn.execute(
+        "UPDATE tax_documents SET received=?, received_date=? WHERE id=?",
+        (1 if received else 0, received_date, doc_id),
+    )
+    return cur.rowcount > 0
+
+
+def get_tax_documents(conn, year: int | None = None) -> list[dict]:
+    where = "WHERE year = ?" if year is not None else ""
+    params = [year] if year is not None else []
+    rows = conn.execute(
+        f"""
+        SELECT id, year, institution, doc_type, received, received_date, notes, created_at
+        FROM tax_documents
+        {where}
+        ORDER BY year DESC, institution, doc_type
+        """,
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_tax_document(conn, doc_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM tax_documents WHERE id = ?", (doc_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_tax_document(conn, doc_id: int) -> bool:
+    cur = conn.execute("DELETE FROM tax_documents WHERE id = ?", (doc_id,))
+    return cur.rowcount > 0
+
+
+# -- Tax info helpers ---------------------------------------------------------
+
+def set_tax_info(conn, key: str, value: str, notes: str | None = None) -> None:
+    conn.execute(
+        """
+        INSERT INTO tax_info (key, value, notes, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value      = excluded.value,
+            notes      = COALESCE(excluded.notes, notes),
+            updated_at = excluded.updated_at
+        """,
+        (key, value, notes),
+    )
+
+
+def get_tax_info(conn, key: str) -> dict | None:
+    row = conn.execute("SELECT * FROM tax_info WHERE key = ?", (key,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_all_tax_info(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT key, value, notes, updated_at FROM tax_info ORDER BY key"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_tax_info(conn, key: str) -> bool:
+    cur = conn.execute("DELETE FROM tax_info WHERE key = ?", (key,))
     return cur.rowcount > 0
